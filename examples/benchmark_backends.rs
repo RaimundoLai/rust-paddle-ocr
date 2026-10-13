@@ -51,7 +51,7 @@ fn benchmark_backend(
 
     for i in 1..=iterations {
         let start = Instant::now();
-        let results = engine.recognize(&image)?;
+        let _results = engine.recognize(&image)?;
         let duration = start.elapsed();
         durations.push(duration);
 
@@ -87,7 +87,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("{}", "#".repeat(60));
 
     // 固定配置
-    let image_path = "/Users/chenzibo/git/rust-paddle-ocr/res/1.png";
+    let image_path = "res/1.png";
     let det_model = "models/PP-OCRv5_mobile_det_fp16.mnn";
     let rec_model = "models/PP-OCRv5_mobile_rec_fp16.mnn";
     let charset = "models/ppocr_keys_v5.txt";

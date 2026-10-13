@@ -2,15 +2,110 @@
 //!
 //! Provides complete OCR pipeline encapsulation, performs detection and recognition in one call
 
-use image::DynamicImage;
+use image::{DynamicImage, GenericImageView};
+use imageproc::point::Point;
+use imageproc::rect::Rect;
 use std::path::{Path, PathBuf};
 
 use crate::det::{DetModel, DetOptions};
 use crate::error::{OcrError, OcrResult};
-use crate::mnn::{Backend, InferenceConfig, PrecisionMode};
+use crate::mnn::{Backend, GpuMemoryMode, GpuTuningMode, InferenceConfig, PrecisionMode};
 use crate::ori::{OriModel, OriOptions};
-use crate::postprocess::TextBox;
-use crate::rec::{RecModel, RecOptions, RecognitionResult};
+use crate::postprocess::{compute_iou, TextBox};
+use crate::rec::{
+    AlignedRecognitionResult, CharacterSpan, RecModel, RecOptions, RecognitionResult,
+};
+
+const PARALLEL_RECOGNITION_MIN_REGIONS: usize = 5;
+const ROTATED_RESULT_IOU_THRESHOLD: f32 = 0.5;
+
+/// Strategy for recognizing text whose baseline is rotated by 90 or 270 degrees.
+///
+/// This is independent of the optional document-orientation model. The latter
+/// rotates a whole page, while this mode handles mixed horizontal and vertical
+/// text regions in the same image.
+#[non_exhaustive]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RotatedTextMode {
+    /// Keep the original single-pass OCR pipeline.
+    #[default]
+    Disabled,
+    /// Re-orient tall regions already found by the normal detection pass.
+    DetectedOnly,
+    /// Also detect on 90° and 270° copies to recover regions missed by the
+    /// normal detection pass.
+    Robust,
+}
+
+/// Per-call recognition options.
+///
+/// Engine configuration and the existing [`OcrEngine::recognize`] API remain
+/// unchanged. Rotated-text support is opt-in so existing users pay no extra
+/// detection or recognition cost.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RecognizeOptions {
+    rotated_text_mode: RotatedTextMode,
+    vertical_aspect_ratio: f32,
+}
+
+impl Default for RecognizeOptions {
+    fn default() -> Self {
+        Self {
+            rotated_text_mode: RotatedTextMode::Disabled,
+            vertical_aspect_ratio: 1.5,
+        }
+    }
+}
+
+impl RecognizeOptions {
+    /// Create default per-call recognition options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Select how rotated text is handled.
+    pub fn with_rotated_text_mode(mut self, mode: RotatedTextMode) -> Self {
+        self.rotated_text_mode = mode;
+        self
+    }
+
+    /// Set the minimum long-side/short-side ratio for a vertical-text candidate.
+    ///
+    /// Invalid values are ignored and the current value is retained.
+    pub fn with_vertical_aspect_ratio(mut self, ratio: f32) -> Self {
+        if ratio.is_finite() && ratio >= 1.0 {
+            self.vertical_aspect_ratio = ratio;
+        }
+        self
+    }
+
+    /// Return the configured rotated-text strategy.
+    pub fn rotated_text_mode(&self) -> RotatedTextMode {
+        self.rotated_text_mode
+    }
+
+    /// Return the vertical candidate aspect-ratio threshold.
+    pub fn vertical_aspect_ratio(&self) -> f32 {
+        self.vertical_aspect_ratio
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegionRecognitionStrategy {
+    Batch,
+    ExactWidthParallel,
+}
+
+fn select_region_recognition_strategy(
+    enable_parallel: bool,
+    region_count: usize,
+) -> RegionRecognitionStrategy {
+    if enable_parallel && region_count >= PARALLEL_RECOGNITION_MIN_REGIONS {
+        RegionRecognitionStrategy::ExactWidthParallel
+    } else {
+        RegionRecognitionStrategy::Batch
+    }
+}
 
 /// OCR result
 #[derive(Debug, Clone)]
@@ -34,11 +129,45 @@ impl OcrResult_ {
     }
 }
 
+/// One recognized character projected back into source-image coordinates.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OcrCharacter {
+    /// Recognized Unicode scalar value.
+    pub character: char,
+    /// Confidence score emitted for this character.
+    pub confidence: f32,
+    /// Character quadrilateral in recognition order: start-top, end-top,
+    /// end-bottom, start-bottom.
+    pub points: [Point<f32>; 4],
+}
+
+/// OCR result with per-character geometry.
+///
+/// This is intentionally separate from [`OcrResult_`] so the alignment API is
+/// additive and existing struct literals and destructuring remain compatible.
+#[derive(Debug, Clone)]
+pub struct AlignedOcrResult {
+    /// Recognized text.
+    pub text: String,
+    /// Confidence score.
+    pub confidence: f32,
+    /// Detected text-region bounding box.
+    pub bbox: TextBox,
+    /// Character quadrilaterals in the same order as `text`.
+    pub characters: Vec<OcrCharacter>,
+}
+
 /// OCR engine configuration
 #[derive(Debug, Clone)]
 pub struct OcrEngineConfig {
     /// Inference backend
     pub backend: Backend,
+    /// OpenCL tensor memory representation
+    pub gpu_memory_mode: GpuMemoryMode,
+    /// Kernel tuning effort. Auto selects fast OpenCL tuning and no Vulkan tuning.
+    pub gpu_tuning_mode: GpuTuningMode,
+    /// Optional persistent GPU cache directory; files are isolated by model/configuration.
+    pub gpu_cache_dir: Option<std::path::PathBuf>,
     /// Thread count
     pub thread_count: i32,
     /// Precision mode
@@ -49,7 +178,7 @@ pub struct OcrEngineConfig {
     pub rec_options: RecOptions,
     /// Orientation options (used when orientation model is enabled)
     pub ori_options: OriOptions,
-    /// Whether to enable parallel recognition (use rayon to process multiple text regions in parallel)
+    /// Whether to enable exact-width parallel recognition for multi-line images
     pub enable_parallel: bool,
     /// Minimum confidence threshold at result level (recognition results below this value will be filtered)
     pub min_result_confidence: f32,
@@ -61,6 +190,9 @@ impl Default for OcrEngineConfig {
     fn default() -> Self {
         Self {
             backend: Backend::CPU,
+            gpu_memory_mode: GpuMemoryMode::Buffer,
+            gpu_tuning_mode: GpuTuningMode::Auto,
+            gpu_cache_dir: None,
             thread_count: 4,
             precision_mode: PrecisionMode::Normal,
             det_options: DetOptions::default(),
@@ -82,6 +214,24 @@ impl OcrEngineConfig {
     /// Set inference backend
     pub fn with_backend(mut self, backend: Backend) -> Self {
         self.backend = backend;
+        self
+    }
+
+    /// Set the OpenCL tensor memory representation.
+    pub fn with_gpu_memory_mode(mut self, mode: GpuMemoryMode) -> Self {
+        self.gpu_memory_mode = mode;
+        self
+    }
+
+    /// Set kernel tuning effort for GPU backends.
+    pub fn with_gpu_tuning(mut self, mode: GpuTuningMode) -> Self {
+        self.gpu_tuning_mode = mode;
+        self
+    }
+
+    /// Persist GPU kernels/tuning results across engine lifetimes.
+    pub fn with_gpu_cache_dir(mut self, directory: impl Into<std::path::PathBuf>) -> Self {
+        self.gpu_cache_dir = Some(directory.into());
         self
     }
 
@@ -117,8 +267,8 @@ impl OcrEngineConfig {
 
     /// Enable/disable parallel processing
     ///
-    /// Note: When multiple text regions are detected, use rayon for parallel recognition.
-    /// If MNN is already set to multi-threading, enabling this option may cause thread contention.
+    /// When at least five text regions are detected, preprocessing is parallelized and each
+    /// region keeps its exact tensor width to avoid padded batch inference.
     pub fn with_parallel(mut self, enable: bool) -> Self {
         self.enable_parallel = enable;
         self
@@ -169,8 +319,20 @@ impl OcrEngineConfig {
     fn to_inference_config(&self) -> InferenceConfig {
         InferenceConfig {
             thread_count: self.thread_count,
-            precision_mode: self.precision_mode,
+            // Normal OCR mode prioritizes numerical stability on Vulkan, whose
+            // native Normal mode may enable fp16 storage/arithmetic.
+            precision_mode: if self.backend == Backend::Vulkan
+                && self.precision_mode == PrecisionMode::Normal
+            {
+                PrecisionMode::High
+            } else {
+                self.precision_mode
+            },
             backend: self.backend,
+            gpu_memory_mode: self.gpu_memory_mode,
+            gpu_tuning_mode: self.gpu_tuning_mode,
+            gpu_cache_dir: self.gpu_cache_dir.clone(),
+            use_cache: self.gpu_cache_dir.is_some(),
             ..Default::default()
         }
     }
@@ -390,6 +552,32 @@ impl OcrEngine {
     /// # Returns
     /// List of OCR results, each result contains text, confidence and bounding box
     pub fn recognize(&self, image: &DynamicImage) -> OcrResult<Vec<OcrResult_>> {
+        self.recognize_with_options(image, &RecognizeOptions::default())
+    }
+
+    /// Perform complete OCR recognition and retain per-character geometry.
+    ///
+    /// This method runs the same models as [`Self::recognize`]; alignment is
+    /// derived from CTC decoder time steps and does not add another inference
+    /// pass.
+    pub fn recognize_with_alignment(
+        &self,
+        image: &DynamicImage,
+    ) -> OcrResult<Vec<AlignedOcrResult>> {
+        self.recognize_with_options_and_alignment(image, &RecognizeOptions::default())
+    }
+
+    /// Perform OCR recognition with per-call options.
+    ///
+    /// [`RotatedTextMode::Disabled`] is the default and runs the same one-pass
+    /// pipeline as [`Self::recognize`]. [`RotatedTextMode::Robust`] performs two
+    /// additional detection passes and only recognizes horizontal candidates
+    /// from those rotated images, keeping the added recognition work small.
+    pub fn recognize_with_options(
+        &self,
+        image: &DynamicImage,
+        options: &RecognizeOptions,
+    ) -> OcrResult<Vec<OcrResult_>> {
         // 0. Orientation correction for full image (optional)
         let corrected_image = if let Some(ori_model) = self.ori_model.as_ref() {
             self.correct_orientation_with_model(ori_model, image.clone())
@@ -397,39 +585,278 @@ impl OcrEngine {
             image.clone()
         };
 
-        // 1. Detect text regions
-        let detections = self.det_model.detect_and_crop(&corrected_image)?;
+        match options.rotated_text_mode {
+            RotatedTextMode::Disabled => self.recognize_single_pass(&corrected_image),
+            RotatedTextMode::DetectedOnly => {
+                self.recognize_detected_text(&corrected_image, options.vertical_aspect_ratio)
+            }
+            RotatedTextMode::Robust => {
+                self.recognize_robust(&corrected_image, options.vertical_aspect_ratio)
+            }
+        }
+    }
 
-        if detections.is_empty() {
+    /// Perform OCR recognition with per-call options and per-character source
+    /// geometry. Existing option and result APIs remain unchanged.
+    pub fn recognize_with_options_and_alignment(
+        &self,
+        image: &DynamicImage,
+        options: &RecognizeOptions,
+    ) -> OcrResult<Vec<AlignedOcrResult>> {
+        let corrected_image = if let Some(ori_model) = self.ori_model.as_ref() {
+            self.correct_orientation_with_model(ori_model, image.clone())
+        } else {
+            image.clone()
+        };
+
+        match options.rotated_text_mode {
+            RotatedTextMode::Disabled => {
+                self.recognize_single_pass_with_alignment(&corrected_image)
+            }
+            RotatedTextMode::DetectedOnly => self.recognize_detected_text_with_alignment(
+                &corrected_image,
+                options.vertical_aspect_ratio,
+            ),
+            RotatedTextMode::Robust => self
+                .recognize_robust_with_alignment(&corrected_image, options.vertical_aspect_ratio),
+        }
+    }
+
+    fn recognize_single_pass_with_alignment(
+        &self,
+        image: &DynamicImage,
+    ) -> OcrResult<Vec<AlignedOcrResult>> {
+        let boxes = self.det_model.detect_expanded(image)?;
+        if boxes.is_empty() {
             return Ok(Vec::new());
         }
 
-        // 2. Batch recognition
-        let (images, boxes): (Vec<DynamicImage>, Vec<TextBox>) = detections.into_iter().unzip();
+        let rec_results = self.recognize_regions_with_alignment(image, &boxes)?;
+        Ok(self.combine_aligned_results(rec_results, boxes.clone(), boxes))
+    }
 
-        let rec_results = if self.config.enable_parallel && images.len() > 4 {
-            // Parallel recognition: for multiple text regions, use rayon for parallel processing
-            use rayon::prelude::*;
-            images
-                .par_iter()
-                .map(|img| self.rec_model.recognize(img))
-                .collect::<OcrResult<Vec<_>>>()?
-        } else {
-            // Sequential recognition: use batch inference
-            self.rec_model.recognize_batch(&images)?
-        };
+    fn recognize_detected_text_with_alignment(
+        &self,
+        image: &DynamicImage,
+        vertical_aspect_ratio: f32,
+    ) -> OcrResult<Vec<AlignedOcrResult>> {
+        let boxes = self.det_model.detect_expanded(image)?;
+        if boxes.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        // 3. Combine results and filter low confidence
-        let results: Vec<OcrResult_> = rec_results
+        let mut rec_results = self.recognize_regions_with_alignment(image, &boxes)?;
+        let mut alignment_boxes = boxes.clone();
+        for (index, text_box) in boxes.iter().enumerate() {
+            if !is_vertical_box(text_box, vertical_aspect_ratio) {
+                continue;
+            }
+
+            let variants = vertical_recognition_variants(text_box);
+            let variant_results = self
+                .rec_model
+                .recognize_regions_with_alignment(image, &variants)?;
+            if let Some((best, best_box)) = variant_results
+                .into_iter()
+                .zip(variants)
+                .max_by(|(a, _), (b, _)| a.confidence.total_cmp(&b.confidence))
+            {
+                if best.confidence > rec_results[index].confidence {
+                    rec_results[index] = best;
+                    alignment_boxes[index] = best_box;
+                }
+            }
+        }
+
+        Ok(self.combine_aligned_results(rec_results, boxes, alignment_boxes))
+    }
+
+    fn recognize_robust_with_alignment(
+        &self,
+        image: &DynamicImage,
+        vertical_aspect_ratio: f32,
+    ) -> OcrResult<Vec<AlignedOcrResult>> {
+        let mut results =
+            self.recognize_detected_text_with_alignment(image, vertical_aspect_ratio)?;
+        let (original_width, original_height) = image.dimensions();
+
+        for turn in [QuarterTurn::Clockwise90, QuarterTurn::Clockwise270] {
+            let rotated_image = turn.rotate(image);
+            let rotated_boxes = self
+                .det_model
+                .detect_expanded(&rotated_image)?
+                .into_iter()
+                .filter(|text_box| is_horizontal_box(text_box, vertical_aspect_ratio))
+                .collect::<Vec<_>>();
+            if rotated_boxes.is_empty() {
+                continue;
+            }
+
+            let rec_results =
+                self.recognize_regions_with_alignment(&rotated_image, &rotated_boxes)?;
+            let rotated_results = self
+                .combine_aligned_results(rec_results, rotated_boxes.clone(), rotated_boxes)
+                .into_iter()
+                .map(|result| {
+                    turn.map_aligned_result_to_original(result, original_width, original_height)
+                });
+            for result in rotated_results {
+                merge_spatial_aligned_result(&mut results, result);
+            }
+        }
+
+        sort_aligned_results_by_reading_order(&mut results);
+        Ok(results)
+    }
+
+    fn recognize_single_pass(&self, image: &DynamicImage) -> OcrResult<Vec<OcrResult_>> {
+        let boxes = self.det_model.detect_expanded(image)?;
+        if boxes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rec_results = self.recognize_regions(image, &boxes)?;
+        Ok(self.combine_results(rec_results, boxes))
+    }
+
+    fn recognize_detected_text(
+        &self,
+        image: &DynamicImage,
+        vertical_aspect_ratio: f32,
+    ) -> OcrResult<Vec<OcrResult_>> {
+        let boxes = self.det_model.detect_expanded(image)?;
+
+        if boxes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut rec_results = self.recognize_regions(image, &boxes)?;
+
+        for (index, text_box) in boxes.iter().enumerate() {
+            if !is_vertical_box(text_box, vertical_aspect_ratio) {
+                continue;
+            }
+
+            let variants = vertical_recognition_variants(text_box);
+            let variant_results = self.rec_model.recognize_regions(image, &variants)?;
+            if let Some(best) = variant_results
+                .into_iter()
+                .max_by(|a, b| a.confidence.total_cmp(&b.confidence))
+            {
+                if best.confidence > rec_results[index].confidence {
+                    rec_results[index] = best;
+                }
+            }
+        }
+
+        Ok(self.combine_results(rec_results, boxes))
+    }
+
+    fn recognize_robust(
+        &self,
+        image: &DynamicImage,
+        vertical_aspect_ratio: f32,
+    ) -> OcrResult<Vec<OcrResult_>> {
+        let mut results = self.recognize_detected_text(image, vertical_aspect_ratio)?;
+        let (original_width, original_height) = image.dimensions();
+
+        for turn in [QuarterTurn::Clockwise90, QuarterTurn::Clockwise270] {
+            let rotated_image = turn.rotate(image);
+            let rotated_boxes = self
+                .det_model
+                .detect_expanded(&rotated_image)?
+                .into_iter()
+                .filter(|text_box| is_horizontal_box(text_box, vertical_aspect_ratio))
+                .collect::<Vec<_>>();
+
+            if rotated_boxes.is_empty() {
+                continue;
+            }
+
+            let rec_results = self.recognize_regions(&rotated_image, &rotated_boxes)?;
+            let rotated_results = rec_results
+                .into_iter()
+                .zip(rotated_boxes)
+                .filter(|(rec, _)| {
+                    !rec.text.is_empty() && rec.confidence >= self.config.min_result_confidence
+                })
+                .map(|(rec, text_box)| {
+                    OcrResult_::new(
+                        rec.text,
+                        rec.confidence,
+                        turn.map_box_to_original(&text_box, original_width, original_height),
+                    )
+                });
+
+            for result in rotated_results {
+                merge_spatial_result(&mut results, result);
+            }
+        }
+
+        sort_results_by_reading_order(&mut results);
+        Ok(results)
+    }
+
+    fn recognize_regions(
+        &self,
+        image: &DynamicImage,
+        boxes: &[TextBox],
+    ) -> OcrResult<Vec<RecognitionResult>> {
+        // Render regions directly into recognition tensors. Large pages use
+        // exact-width tensors to avoid padding every line to the widest region.
+        match select_region_recognition_strategy(self.config.enable_parallel, boxes.len()) {
+            RegionRecognitionStrategy::Batch => self.rec_model.recognize_regions(image, boxes),
+            RegionRecognitionStrategy::ExactWidthParallel => self
+                .rec_model
+                .recognize_regions_exact_parallel(image, boxes),
+        }
+    }
+
+    fn recognize_regions_with_alignment(
+        &self,
+        image: &DynamicImage,
+        boxes: &[TextBox],
+    ) -> OcrResult<Vec<AlignedRecognitionResult>> {
+        match select_region_recognition_strategy(self.config.enable_parallel, boxes.len()) {
+            RegionRecognitionStrategy::Batch => self
+                .rec_model
+                .recognize_regions_with_alignment(image, boxes),
+            RegionRecognitionStrategy::ExactWidthParallel => self
+                .rec_model
+                .recognize_regions_exact_parallel_with_alignment(image, boxes),
+        }
+    }
+
+    fn combine_results(
+        &self,
+        rec_results: Vec<RecognitionResult>,
+        boxes: Vec<TextBox>,
+    ) -> Vec<OcrResult_> {
+        rec_results
             .into_iter()
             .zip(boxes)
             .filter(|(rec, _)| {
                 !rec.text.is_empty() && rec.confidence >= self.config.min_result_confidence
             })
             .map(|(rec, bbox)| OcrResult_::new(rec.text, rec.confidence, bbox))
-            .collect();
+            .collect()
+    }
 
-        Ok(results)
+    fn combine_aligned_results(
+        &self,
+        rec_results: Vec<AlignedRecognitionResult>,
+        boxes: Vec<TextBox>,
+        alignment_boxes: Vec<TextBox>,
+    ) -> Vec<AlignedOcrResult> {
+        rec_results
+            .into_iter()
+            .zip(boxes)
+            .zip(alignment_boxes)
+            .filter(|((rec, _), _)| {
+                !rec.text.is_empty() && rec.confidence >= self.config.min_result_confidence
+            })
+            .map(|((rec, bbox), alignment_box)| aligned_ocr_result(rec, bbox, &alignment_box))
+            .collect()
     }
 
     /// Perform detection only
@@ -489,6 +916,288 @@ impl OcrEngine {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum QuarterTurn {
+    Clockwise90,
+    Clockwise270,
+}
+
+impl QuarterTurn {
+    fn rotate(self, image: &DynamicImage) -> DynamicImage {
+        match self {
+            Self::Clockwise90 => image.rotate90(),
+            Self::Clockwise270 => image.rotate270(),
+        }
+    }
+
+    fn map_box_to_original(
+        self,
+        text_box: &TextBox,
+        original_width: u32,
+        original_height: u32,
+    ) -> TextBox {
+        let points = text_box_points(text_box).map(|point| {
+            let mapped = match self {
+                Self::Clockwise90 => {
+                    Point::new(point.y, original_height.saturating_sub(1) as f32 - point.x)
+                }
+                Self::Clockwise270 => {
+                    Point::new(original_width.saturating_sub(1) as f32 - point.y, point.x)
+                }
+            };
+            Point::new(
+                mapped.x.clamp(0.0, original_width.saturating_sub(1) as f32),
+                mapped
+                    .y
+                    .clamp(0.0, original_height.saturating_sub(1) as f32),
+            )
+        });
+        let points = order_box_points(points);
+        let rect = rect_for_points(&points, original_width, original_height)
+            .unwrap_or_else(|| Rect::at(0, 0).of_size(1, 1));
+
+        TextBox::with_points(rect, text_box.score, points)
+    }
+
+    fn map_point_to_original(
+        self,
+        point: Point<f32>,
+        original_width: u32,
+        original_height: u32,
+    ) -> Point<f32> {
+        let mapped = match self {
+            Self::Clockwise90 => {
+                Point::new(point.y, original_height.saturating_sub(1) as f32 - point.x)
+            }
+            Self::Clockwise270 => {
+                Point::new(original_width.saturating_sub(1) as f32 - point.y, point.x)
+            }
+        };
+        Point::new(
+            mapped.x.clamp(0.0, original_width.saturating_sub(1) as f32),
+            mapped
+                .y
+                .clamp(0.0, original_height.saturating_sub(1) as f32),
+        )
+    }
+
+    fn map_aligned_result_to_original(
+        self,
+        mut result: AlignedOcrResult,
+        original_width: u32,
+        original_height: u32,
+    ) -> AlignedOcrResult {
+        result.bbox = self.map_box_to_original(&result.bbox, original_width, original_height);
+        for character in &mut result.characters {
+            character.points = character
+                .points
+                .map(|point| self.map_point_to_original(point, original_width, original_height));
+        }
+        result
+    }
+}
+
+fn aligned_ocr_result(
+    recognition: AlignedRecognitionResult,
+    bbox: TextBox,
+    alignment_box: &TextBox,
+) -> AlignedOcrResult {
+    let characters = recognition
+        .characters
+        .into_iter()
+        .map(|span| OcrCharacter {
+            character: span.character,
+            confidence: span.confidence,
+            points: character_quad(alignment_box, &span),
+        })
+        .collect();
+    AlignedOcrResult {
+        text: recognition.text,
+        confidence: recognition.confidence,
+        bbox,
+        characters,
+    }
+}
+
+fn character_quad(text_box: &TextBox, span: &CharacterSpan) -> [Point<f32>; 4] {
+    let [start_top, end_top, end_bottom, start_bottom] = text_box_points(text_box);
+    [
+        lerp_point(start_top, end_top, span.start),
+        lerp_point(start_top, end_top, span.end),
+        lerp_point(start_bottom, end_bottom, span.end),
+        lerp_point(start_bottom, end_bottom, span.start),
+    ]
+}
+
+fn lerp_point(start: Point<f32>, end: Point<f32>, position: f32) -> Point<f32> {
+    let position = position.clamp(0.0, 1.0);
+    Point::new(
+        start.x + (end.x - start.x) * position,
+        start.y + (end.y - start.y) * position,
+    )
+}
+
+fn box_dimensions(text_box: &TextBox) -> (f32, f32) {
+    if let Some(points) = text_box.points {
+        let width = point_distance(points[0], points[1]).max(point_distance(points[3], points[2]));
+        let height = point_distance(points[0], points[3]).max(point_distance(points[1], points[2]));
+        (width.max(1.0), height.max(1.0))
+    } else {
+        (
+            text_box.rect.width().max(1) as f32,
+            text_box.rect.height().max(1) as f32,
+        )
+    }
+}
+
+fn is_vertical_box(text_box: &TextBox, aspect_ratio: f32) -> bool {
+    let (width, height) = box_dimensions(text_box);
+    height / width.max(1.0) >= aspect_ratio
+}
+
+fn is_horizontal_box(text_box: &TextBox, aspect_ratio: f32) -> bool {
+    let (width, height) = box_dimensions(text_box);
+    width / height.max(1.0) >= aspect_ratio
+}
+
+fn vertical_recognition_variants(text_box: &TextBox) -> [TextBox; 2] {
+    let [top_left, top_right, bottom_right, bottom_left] = text_box_points(text_box);
+    [
+        TextBox::with_points(
+            text_box.rect,
+            text_box.score,
+            [bottom_left, top_left, top_right, bottom_right],
+        ),
+        TextBox::with_points(
+            text_box.rect,
+            text_box.score,
+            [top_right, bottom_right, bottom_left, top_left],
+        ),
+    ]
+}
+
+fn text_box_points(text_box: &TextBox) -> [Point<f32>; 4] {
+    text_box.points.unwrap_or_else(|| {
+        let left = text_box.rect.left() as f32;
+        let top = text_box.rect.top() as f32;
+        let right = left + text_box.rect.width().saturating_sub(1) as f32;
+        let bottom = top + text_box.rect.height().saturating_sub(1) as f32;
+        [
+            Point::new(left, top),
+            Point::new(right, top),
+            Point::new(right, bottom),
+            Point::new(left, bottom),
+        ]
+    })
+}
+
+fn order_box_points(points: [Point<f32>; 4]) -> [Point<f32>; 4] {
+    let mut top_left = points[0];
+    let mut top_right = points[0];
+    let mut bottom_right = points[0];
+    let mut bottom_left = points[0];
+
+    for point in points {
+        if point.x + point.y < top_left.x + top_left.y {
+            top_left = point;
+        }
+        if point.x + point.y > bottom_right.x + bottom_right.y {
+            bottom_right = point;
+        }
+        if point.x - point.y > top_right.x - top_right.y {
+            top_right = point;
+        }
+        if point.x - point.y < bottom_left.x - bottom_left.y {
+            bottom_left = point;
+        }
+    }
+
+    [top_left, top_right, bottom_right, bottom_left]
+}
+
+fn rect_for_points(points: &[Point<f32>; 4], image_width: u32, image_height: u32) -> Option<Rect> {
+    let min_x = points
+        .iter()
+        .map(|point| point.x)
+        .fold(f32::INFINITY, f32::min)
+        .floor()
+        .max(0.0) as u32;
+    let min_y = points
+        .iter()
+        .map(|point| point.y)
+        .fold(f32::INFINITY, f32::min)
+        .floor()
+        .max(0.0) as u32;
+    let max_x = points
+        .iter()
+        .map(|point| point.x)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .min(image_width as f32) as u32;
+    let max_y = points
+        .iter()
+        .map(|point| point.y)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .min(image_height as f32) as u32;
+
+    if max_x <= min_x || max_y <= min_y {
+        return None;
+    }
+
+    Some(Rect::at(min_x as i32, min_y as i32).of_size(max_x - min_x, max_y - min_y))
+}
+
+fn point_distance(a: Point<f32>, b: Point<f32>) -> f32 {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    (dx * dx + dy * dy).sqrt()
+}
+
+fn merge_spatial_result(results: &mut Vec<OcrResult_>, candidate: OcrResult_) {
+    if let Some(existing) = results.iter_mut().find(|result| {
+        compute_iou(&result.bbox.rect, &candidate.bbox.rect) >= ROTATED_RESULT_IOU_THRESHOLD
+    }) {
+        if candidate.confidence > existing.confidence {
+            *existing = candidate;
+        }
+    } else {
+        results.push(candidate);
+    }
+}
+
+fn merge_spatial_aligned_result(results: &mut Vec<AlignedOcrResult>, candidate: AlignedOcrResult) {
+    if let Some(existing) = results.iter_mut().find(|result| {
+        compute_iou(&result.bbox.rect, &candidate.bbox.rect) >= ROTATED_RESULT_IOU_THRESHOLD
+    }) {
+        if candidate.confidence > existing.confidence {
+            *existing = candidate;
+        }
+    } else {
+        results.push(candidate);
+    }
+}
+
+fn sort_results_by_reading_order(results: &mut [OcrResult_]) {
+    results.sort_by(|a, b| {
+        a.bbox
+            .rect
+            .top()
+            .cmp(&b.bbox.rect.top())
+            .then_with(|| a.bbox.rect.left().cmp(&b.bbox.rect.left()))
+    });
+}
+
+fn sort_aligned_results_by_reading_order(results: &mut [AlignedOcrResult]) {
+    results.sort_by(|a, b| {
+        a.bbox
+            .rect
+            .top()
+            .cmp(&b.bbox.rect.top())
+            .then_with(|| a.bbox.rect.left().cmp(&b.bbox.rect.left()))
+    });
+}
+
 /// Builder for OCR engine
 pub struct OcrEngineBuilder {
     det_model_path: Option<PathBuf>,
@@ -496,6 +1205,12 @@ pub struct OcrEngineBuilder {
     charset_path: Option<PathBuf>,
     ori_model_path: Option<PathBuf>,
     config: Option<OcrEngineConfig>,
+}
+
+impl Default for OcrEngineBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OcrEngineBuilder {
@@ -595,6 +1310,14 @@ impl RecOnlyEngine {
         self.rec_model.recognize(image)
     }
 
+    /// Recognize a single image and retain per-character CTC alignment.
+    pub fn recognize_with_alignment(
+        &self,
+        image: &DynamicImage,
+    ) -> OcrResult<AlignedRecognitionResult> {
+        self.rec_model.recognize_with_alignment(image)
+    }
+
     /// Return text only
     pub fn recognize_text(&self, image: &DynamicImage) -> OcrResult<String> {
         self.rec_model.recognize_text(image)
@@ -668,11 +1391,167 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parallel_strategy_uses_exact_width_only_for_multi_line_pages() {
+        assert_eq!(
+            select_region_recognition_strategy(true, 5),
+            RegionRecognitionStrategy::ExactWidthParallel
+        );
+        assert_eq!(
+            select_region_recognition_strategy(true, 4),
+            RegionRecognitionStrategy::Batch
+        );
+        assert_eq!(
+            select_region_recognition_strategy(false, 12),
+            RegionRecognitionStrategy::Batch
+        );
+    }
+
+    #[test]
     fn test_ocr_result() {
         let bbox = TextBox::new(imageproc::rect::Rect::at(0, 0).of_size(100, 20), 0.9);
         let result = OcrResult_::new("Hello".to_string(), 0.95, bbox);
 
         assert_eq!(result.text, "Hello");
         assert_eq!(result.confidence, 0.95);
+    }
+
+    #[test]
+    fn recognize_options_are_disabled_by_default() {
+        let options = RecognizeOptions::default();
+
+        assert_eq!(options.rotated_text_mode(), RotatedTextMode::Disabled);
+        assert_eq!(options.vertical_aspect_ratio(), 1.5);
+    }
+
+    #[test]
+    fn recognize_options_ignore_invalid_aspect_ratios() {
+        let options = RecognizeOptions::new()
+            .with_vertical_aspect_ratio(2.0)
+            .with_vertical_aspect_ratio(f32::NAN)
+            .with_vertical_aspect_ratio(0.5);
+
+        assert_eq!(options.vertical_aspect_ratio(), 2.0);
+    }
+
+    #[test]
+    fn ocr_config_defaults_to_buffer_memory_for_opencl() {
+        let config = OcrEngineConfig::new().with_backend(Backend::OpenCL);
+        assert_eq!(config.gpu_memory_mode, GpuMemoryMode::Buffer);
+        assert_eq!(
+            config.to_inference_config().gpu_memory_mode,
+            GpuMemoryMode::Buffer
+        );
+    }
+
+    #[test]
+    fn vulkan_ocr_defaults_to_high_precision_without_overriding_explicit_low() {
+        let config = OcrEngineConfig::new().with_backend(Backend::Vulkan);
+        assert_eq!(
+            config.to_inference_config().precision_mode,
+            PrecisionMode::High
+        );
+        assert_eq!(
+            config.to_inference_config().gpu_tuning_mode,
+            GpuTuningMode::Auto
+        );
+        assert_eq!(
+            config
+                .with_precision(PrecisionMode::Low)
+                .to_inference_config()
+                .precision_mode,
+            PrecisionMode::Low
+        );
+        assert_eq!(
+            OcrEngineConfig::new().to_inference_config().precision_mode,
+            PrecisionMode::Normal
+        );
+    }
+
+    #[test]
+    fn quarter_turns_map_boxes_back_to_original_coordinates() {
+        let clockwise_90_box = TextBox::with_points(
+            Rect::at(30, 10).of_size(9, 29),
+            0.9,
+            [
+                Point::new(30.0, 10.0),
+                Point::new(39.0, 10.0),
+                Point::new(39.0, 39.0),
+                Point::new(30.0, 39.0),
+            ],
+        );
+        let clockwise_270_box = TextBox::with_points(
+            Rect::at(20, 60).of_size(9, 29),
+            0.9,
+            [
+                Point::new(20.0, 60.0),
+                Point::new(29.0, 60.0),
+                Point::new(29.0, 89.0),
+                Point::new(20.0, 89.0),
+            ],
+        );
+
+        let from_90 = QuarterTurn::Clockwise90.map_box_to_original(&clockwise_90_box, 100, 60);
+        let from_270 = QuarterTurn::Clockwise270.map_box_to_original(&clockwise_270_box, 100, 60);
+
+        for mapped in [from_90, from_270] {
+            assert_eq!(mapped.rect.left(), 10);
+            assert_eq!(mapped.rect.top(), 20);
+            assert_eq!(mapped.rect.width(), 29);
+            assert_eq!(mapped.rect.height(), 9);
+            assert!(is_horizontal_box(&mapped, 1.5));
+        }
+    }
+
+    #[test]
+    fn vertical_variants_turn_a_tall_box_into_horizontal_regions() {
+        let text_box = TextBox::new(Rect::at(10, 20).of_size(20, 80), 0.9);
+
+        let variants = vertical_recognition_variants(&text_box);
+
+        assert!(variants
+            .iter()
+            .all(|variant| is_horizontal_box(variant, 1.5)));
+    }
+
+    #[test]
+    fn merge_spatial_result_keeps_only_the_highest_confidence() {
+        let bbox = TextBox::new(Rect::at(10, 20).of_size(20, 80), 0.9);
+        let mut results = vec![OcrResult_::new("低".into(), 0.6, bbox.clone())];
+
+        merge_spatial_result(&mut results, OcrResult_::new("高".into(), 0.9, bbox));
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].text, "高");
+        assert_eq!(results[0].confidence, 0.9);
+    }
+
+    #[test]
+    fn character_quad_interpolates_rotated_text_geometry() {
+        let text_box = TextBox::with_points(
+            Rect::at(10, 20).of_size(100, 30),
+            0.9,
+            [
+                Point::new(10.0, 20.0),
+                Point::new(110.0, 30.0),
+                Point::new(108.0, 60.0),
+                Point::new(8.0, 50.0),
+            ],
+        );
+        let span = CharacterSpan {
+            character: '中',
+            confidence: 0.95,
+            start: 0.25,
+            end: 0.5,
+        };
+
+        assert_eq!(
+            character_quad(&text_box, &span),
+            [
+                Point::new(35.0, 22.5),
+                Point::new(60.0, 25.0),
+                Point::new(58.0, 55.0),
+                Point::new(33.0, 52.5),
+            ]
+        );
     }
 }

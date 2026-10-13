@@ -2,11 +2,12 @@
 //!
 //! 使用 res/1.png（纯英文图片）统一测试所有模型的推理能力
 
-use ocr_rs::{DetModel, OcrEngine, OriModel, RecModel};
+use ocr_rs::{DetModel, OcrEngine, OcrEngineConfig, OriModel, RecModel};
 
 const TEST_IMAGE: &str = "res/1.png";
 /// 5.png 是 1.png 顺时针旋转 90° 的图片，用于测试方向检测
 const TEST_IMAGE_ROTATED_90: &str = "res/5.png";
+const TEST_IMAGES: &[&str] = &["res/1.png", "res/2.png", "res/3.png", "res/4.png"];
 
 // ============================================================
 // 检测模型路径
@@ -14,6 +15,9 @@ const TEST_IMAGE_ROTATED_90: &str = "res/5.png";
 const DET_V5: &str = "models/PP-OCRv5_mobile_det.mnn";
 const DET_V5_FP16: &str = "models/PP-OCRv5_mobile_det_fp16.mnn";
 const DET_V4: &str = "models/ch_PP-OCRv4_det_infer.mnn";
+const DET_V6_TINY: &str = "models/PP-OCRv6_tiny_det.mnn";
+const DET_V6_SMALL: &str = "models/PP-OCRv6_small_det.mnn";
+const DET_V6_MEDIUM: &str = "models/PP-OCRv6_medium_det.mnn";
 
 // ============================================================
 // 识别模型 + 字符集路径
@@ -24,6 +28,15 @@ const CHARSET_V5: &str = "models/ppocr_keys_v5.txt";
 
 const REC_V4: &str = "models/ch_PP-OCRv4_rec_infer.mnn";
 const CHARSET_V4: &str = "models/ppocr_keys_v4.txt";
+
+const REC_V6_TINY: &str = "models/PP-OCRv6_tiny_rec.mnn";
+const CHARSET_V6_TINY: &str = "models/ppocr_keys_v6_tiny.txt";
+
+const REC_V6_SMALL: &str = "models/PP-OCRv6_small_rec.mnn";
+const CHARSET_V6_SMALL: &str = "models/ppocr_keys_v6_small.txt";
+
+const REC_V6_MEDIUM: &str = "models/PP-OCRv6_medium_rec.mnn";
+const CHARSET_V6_MEDIUM: &str = "models/ppocr_keys_v6_medium.txt";
 
 const REC_EN: &str = "models/en_PP-OCRv5_mobile_rec_infer.mnn";
 const CHARSET_EN: &str = "models/ppocr_keys_en.txt";
@@ -81,23 +94,40 @@ fn load_test_image() -> image::DynamicImage {
 
 /// 通用：检测模型 + 识别模型 完整 pipeline 测试
 fn run_full_pipeline(det_path: &str, rec_path: &str, charset_path: &str, label: &str) {
+    run_full_pipeline_on_image(det_path, rec_path, charset_path, TEST_IMAGE, label);
+}
+
+fn run_full_pipeline_on_image(
+    det_path: &str,
+    rec_path: &str,
+    charset_path: &str,
+    image_path: &str,
+    label: &str,
+) {
     if !require_file(det_path)
         || !require_file(rec_path)
         || !require_file(charset_path)
-        || !require_file(TEST_IMAGE)
+        || !require_file(image_path)
     {
         return;
     }
 
-    let engine = OcrEngine::new(det_path, rec_path, charset_path, None)
+    let config = OcrEngineConfig::fast().with_min_result_confidence(0.0);
+    let engine = OcrEngine::new(det_path, rec_path, charset_path, Some(config))
         .unwrap_or_else(|e| panic!("[{}] 引擎创建失败: {:?}", label, e));
 
-    let image = load_test_image();
+    let image = image::open(image_path)
+        .unwrap_or_else(|e| panic!("[{}] 无法打开 {}: {:?}", label, image_path, e));
     let results = engine
         .recognize(&image)
         .unwrap_or_else(|e| panic!("[{}] 识别失败: {:?}", label, e));
 
-    println!("[{}] 识别到 {} 个文本区域", label, results.len());
+    println!(
+        "[{}:{}] 识别到 {} 个文本区域",
+        label,
+        image_path,
+        results.len()
+    );
     for r in &results {
         println!("  text={:?}  confidence={:.4}", r.text, r.confidence);
     }
@@ -112,6 +142,86 @@ fn run_full_pipeline(det_path: &str, rec_path: &str, charset_path: &str, label: 
             r.confidence
         );
     }
+}
+
+fn assert_fixture_recognizes_text(
+    det_path: &str,
+    rec_path: &str,
+    charset_path: &str,
+    image_path: &str,
+    label: &str,
+) {
+    if !require_file(det_path)
+        || !require_file(rec_path)
+        || !require_file(charset_path)
+        || !require_file(image_path)
+    {
+        return;
+    }
+
+    let config = OcrEngineConfig::fast().with_min_result_confidence(0.0);
+    let engine = OcrEngine::new(det_path, rec_path, charset_path, Some(config))
+        .unwrap_or_else(|e| panic!("[{}] 引擎创建失败: {:?}", label, e));
+    let image = image::open(image_path).expect("无法打开多语言测试图片");
+    let results = engine
+        .recognize(&image)
+        .unwrap_or_else(|e| panic!("[{}] 多语言 fixture 识别失败: {:?}", label, e));
+
+    println!(
+        "[{}] fixture={} results={}",
+        label,
+        image_path,
+        results.len()
+    );
+    for result in &results {
+        println!(
+            "  text={:?} confidence={:.4}",
+            result.text, result.confidence
+        );
+        assert!(
+            result.confidence >= 0.0 && result.confidence <= 1.0,
+            "[{}] 置信度应在 [0,1] 范围内，实际: {}",
+            label,
+            result.confidence
+        );
+        assert!(result.bbox.area() > 0, "[{}] bbox 面积应大于 0", label);
+    }
+
+    let joined = results
+        .iter()
+        .map(|result| result.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !joined.trim().is_empty(),
+        "[{}] 多语言 fixture 应至少识别出一段文本",
+        label
+    );
+    assert!(
+        joined.chars().any(|ch| ch.is_ascii_digit()),
+        "[{}] 多语言 fixture 应识别出图片中的数字，实际: {:?}",
+        label,
+        joined
+    );
+}
+
+fn legacy_crop_pipeline(engine: &OcrEngine, image: &image::DynamicImage) -> Vec<(String, usize)> {
+    let detections = engine
+        .det_model()
+        .detect_and_crop(image)
+        .expect("legacy detect_and_crop failed");
+    let (images, boxes): (Vec<_>, Vec<_>) = detections.into_iter().unzip();
+    let rec_results = engine
+        .rec_model()
+        .recognize_batch(&images)
+        .expect("legacy recognize_batch failed");
+
+    rec_results
+        .into_iter()
+        .zip(boxes)
+        .filter(|(rec, _)| !rec.text.is_empty())
+        .map(|(rec, bbox)| (rec.text, bbox.area() as usize))
+        .collect()
 }
 
 /// 通用：仅检测模型测试
@@ -191,6 +301,21 @@ fn test_det_v4() {
     run_det_only(DET_V4, "det-v4");
 }
 
+#[test]
+fn test_det_v6_tiny() {
+    run_det_only(DET_V6_TINY, "det-v6-tiny");
+}
+
+#[test]
+fn test_det_v6_small() {
+    run_det_only(DET_V6_SMALL, "det-v6-small");
+}
+
+#[test]
+fn test_det_v6_medium() {
+    run_det_only(DET_V6_MEDIUM, "det-v6-medium");
+}
+
 // ============================================================
 // 识别模型测试（仅识别，使用 v5 det 做前置检测）
 // ============================================================
@@ -208,6 +333,21 @@ fn test_rec_v5_fp16() {
 #[test]
 fn test_rec_v4() {
     run_rec_only(REC_V4, CHARSET_V4, "rec-v4");
+}
+
+#[test]
+fn test_rec_v6_tiny() {
+    run_rec_only(REC_V6_TINY, CHARSET_V6_TINY, "rec-v6-tiny");
+}
+
+#[test]
+fn test_rec_v6_small() {
+    run_rec_only(REC_V6_SMALL, CHARSET_V6_SMALL, "rec-v6-small");
+}
+
+#[test]
+fn test_rec_v6_medium() {
+    run_rec_only(REC_V6_MEDIUM, CHARSET_V6_MEDIUM, "rec-v6-medium");
 }
 
 #[test]
@@ -290,6 +430,36 @@ fn test_pipeline_v4_det_v4_rec() {
 }
 
 #[test]
+fn test_pipeline_v6_tiny() {
+    run_full_pipeline(
+        DET_V6_TINY,
+        REC_V6_TINY,
+        CHARSET_V6_TINY,
+        "pipeline-v6-tiny",
+    );
+}
+
+#[test]
+fn test_pipeline_v6_small() {
+    run_full_pipeline(
+        DET_V6_SMALL,
+        REC_V6_SMALL,
+        CHARSET_V6_SMALL,
+        "pipeline-v6-small",
+    );
+}
+
+#[test]
+fn test_pipeline_v6_medium() {
+    run_full_pipeline(
+        DET_V6_MEDIUM,
+        REC_V6_MEDIUM,
+        CHARSET_V6_MEDIUM,
+        "pipeline-v6-medium",
+    );
+}
+
+#[test]
 fn test_pipeline_v5_det_en_rec() {
     run_full_pipeline(DET_V5, REC_EN, CHARSET_EN, "pipeline-v5+en");
 }
@@ -352,6 +522,233 @@ fn test_pipeline_v5_det_te_rec() {
 #[test]
 fn test_pipeline_v5_det_th_rec() {
     run_full_pipeline(DET_V5, REC_TH, CHARSET_TH, "pipeline-v5+th");
+}
+
+#[test]
+fn test_v6_tiers_on_multiple_document_images() {
+    for image_path in TEST_IMAGES {
+        run_full_pipeline_on_image(
+            DET_V6_TINY,
+            REC_V6_TINY,
+            CHARSET_V6_TINY,
+            image_path,
+            "pipeline-v6-tiny-multi-image",
+        );
+        run_full_pipeline_on_image(
+            DET_V6_SMALL,
+            REC_V6_SMALL,
+            CHARSET_V6_SMALL,
+            image_path,
+            "pipeline-v6-small-multi-image",
+        );
+    }
+}
+
+#[test]
+fn test_multilingual_fixture_pipelines() {
+    let cases = [
+        (
+            DET_V6_SMALL,
+            REC_V6_SMALL,
+            CHARSET_V6_SMALL,
+            "tests/fixtures/multilingual/latin.png",
+            "fixture-v6-latin",
+        ),
+        (
+            DET_V6_SMALL,
+            REC_V6_SMALL,
+            CHARSET_V6_SMALL,
+            "tests/fixtures/multilingual/cjk.png",
+            "fixture-v6-cjk",
+        ),
+        (
+            DET_V5,
+            REC_KOREAN,
+            CHARSET_KOREAN,
+            "tests/fixtures/multilingual/korean.png",
+            "fixture-korean",
+        ),
+        (
+            DET_V5,
+            REC_ARABIC,
+            CHARSET_ARABIC,
+            "tests/fixtures/multilingual/arabic.png",
+            "fixture-arabic",
+        ),
+        (
+            DET_V5,
+            REC_CYRILLIC,
+            CHARSET_CYRILLIC,
+            "tests/fixtures/multilingual/cyrillic.png",
+            "fixture-cyrillic",
+        ),
+        (
+            DET_V5,
+            REC_DEVANAGARI,
+            CHARSET_DEVANAGARI,
+            "tests/fixtures/multilingual/devanagari.png",
+            "fixture-devanagari",
+        ),
+        (
+            DET_V5,
+            REC_TH,
+            CHARSET_TH,
+            "tests/fixtures/multilingual/thai.png",
+            "fixture-thai",
+        ),
+        (
+            DET_V5,
+            REC_EL,
+            CHARSET_EL,
+            "tests/fixtures/multilingual/greek.png",
+            "fixture-greek",
+        ),
+        (
+            DET_V5,
+            REC_TA,
+            CHARSET_TA,
+            "tests/fixtures/multilingual/tamil.png",
+            "fixture-tamil",
+        ),
+        (
+            DET_V5,
+            REC_TE,
+            CHARSET_TE,
+            "tests/fixtures/multilingual/telugu.png",
+            "fixture-telugu",
+        ),
+    ];
+
+    for (det_path, rec_path, charset_path, image_path, label) in cases {
+        assert_fixture_recognizes_text(det_path, rec_path, charset_path, image_path, label);
+    }
+}
+
+#[test]
+fn test_engine_pipeline_matches_public_crop_pipeline() {
+    if !require_file(DET_V6_TINY)
+        || !require_file(REC_V6_TINY)
+        || !require_file(CHARSET_V6_TINY)
+        || !require_file(TEST_IMAGE)
+    {
+        return;
+    }
+
+    let config = OcrEngineConfig::fast()
+        .with_parallel(false)
+        .with_min_result_confidence(0.0);
+    let engine = OcrEngine::new(DET_V6_TINY, REC_V6_TINY, CHARSET_V6_TINY, Some(config))
+        .expect("OCR 引擎创建失败");
+    let image = load_test_image();
+
+    let engine_results = engine.recognize(&image).expect("engine recognize failed");
+    let legacy_results = legacy_crop_pipeline(&engine, &image);
+
+    let engine_texts = engine_results
+        .iter()
+        .filter(|result| !result.text.is_empty())
+        .map(|result| (result.text.clone(), result.bbox.area() as usize))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        engine_texts, legacy_results,
+        "OcrEngine::recognize 应与公开 detect_and_crop + recognize_batch 路径保持一致"
+    );
+}
+
+#[test]
+fn test_parallel_engine_pipeline_preserves_page_goldens_and_order() {
+    if !require_file(DET_V6_TINY) || !require_file(REC_V6_TINY) || !require_file(CHARSET_V6_TINY) {
+        return;
+    }
+
+    let config = OcrEngineConfig::fast()
+        .with_parallel(true)
+        .with_min_result_confidence(0.0);
+    let parallel_engine = OcrEngine::new(DET_V6_TINY, REC_V6_TINY, CHARSET_V6_TINY, Some(config))
+        .expect("OCR 引擎创建失败");
+    let batch_config = OcrEngineConfig::fast()
+        .with_parallel(false)
+        .with_min_result_confidence(0.0);
+    let batch_engine = OcrEngine::new(
+        DET_V6_TINY,
+        REC_V6_TINY,
+        CHARSET_V6_TINY,
+        Some(batch_config),
+    )
+    .expect("batch OCR 引擎创建失败");
+    let golden_fragments = [
+        (
+            "res/1.png",
+            [
+                "The dominant sequence transduction models",
+                "Transformer generalizes",
+            ],
+        ),
+        (
+            "res/2.png",
+            ["Attention Is All You Need", "Submission history"],
+        ),
+        ("res/3.png", ["镀膜技术暗战", "2025年初上海眼镜展"]),
+        ("res/4.png", ["FLD", "PP-LiteSeg"]),
+    ];
+
+    for image_path in TEST_IMAGES {
+        if !require_file(image_path) {
+            continue;
+        }
+
+        let image = image::open(image_path).expect("无法加载页面测试图片");
+        let parallel_results = parallel_engine
+            .recognize(&image)
+            .expect("parallel recognize failed");
+        let batch_results = batch_engine
+            .recognize(&image)
+            .expect("batch recognize failed");
+        let batch_boxes = batch_results
+            .iter()
+            .map(|result| {
+                (
+                    result.bbox.rect.left(),
+                    result.bbox.rect.top(),
+                    result.bbox.rect.width(),
+                    result.bbox.rect.height(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let parallel_boxes = parallel_results
+            .iter()
+            .map(|result| {
+                (
+                    result.bbox.rect.left(),
+                    result.bbox.rect.top(),
+                    result.bbox.rect.width(),
+                    result.bbox.rect.height(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            parallel_boxes, batch_boxes,
+            "parallel exact-width dispatch changed result order or boxes for {image_path}"
+        );
+
+        let joined = parallel_results
+            .iter()
+            .map(|result| result.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (_, expected_fragments) = golden_fragments
+            .iter()
+            .find(|(path, _)| path == image_path)
+            .expect("missing page golden fragments");
+        for fragment in expected_fragments {
+            assert!(
+                joined.contains(fragment),
+                "parallel OCR output for {image_path} lost golden fragment {fragment:?}: {joined:?}"
+            );
+        }
+    }
 }
 
 // ============================================================

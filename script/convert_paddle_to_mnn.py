@@ -2,6 +2,7 @@ import os
 import sys
 import subprocess
 import argparse
+import shutil
 import yaml
 from pathlib import Path
 
@@ -137,6 +138,69 @@ def extract_character_dict(model_dir):
         return False
 
 
+def charset_filename_for_model(model_name):
+    """Return runtime charset filename for known recognition model directories"""
+    ppocrv6_charsets = {
+        "PP-OCRv6_tiny_rec": "ppocr_keys_v6_tiny.txt",
+        "PP-OCRv6_small_rec": "ppocr_keys_v6_small.txt",
+        "PP-OCRv6_medium_rec": "ppocr_keys_v6_medium.txt",
+    }
+    if model_name in ppocrv6_charsets:
+        return ppocrv6_charsets[model_name]
+
+    if model_name in ("ch_PP-OCRv4_rec_infer", "PP-OCRv4_rec"):
+        return "ppocr_keys_v4.txt"
+
+    if model_name in ("PP-OCRv5_mobile_rec", "PP-OCRv5_mobile_rec_infer"):
+        return "ppocr_keys_v5.txt"
+
+    ppocrv5_prefixes = {
+        "korean": "ppocr_keys_korean.txt",
+        "latin": "ppocr_keys_latin.txt",
+        "eslav": "ppocr_keys_eslav.txt",
+        "th": "ppocr_keys_th.txt",
+        "el": "ppocr_keys_el.txt",
+        "en": "ppocr_keys_en.txt",
+        "cyrillic": "ppocr_keys_cyrillic.txt",
+        "arabic": "ppocr_keys_arabic.txt",
+        "devanagari": "ppocr_keys_devanagari.txt",
+        "ta": "ppocr_keys_ta.txt",
+        "te": "ppocr_keys_te.txt",
+    }
+    for prefix, charset_filename in ppocrv5_prefixes.items():
+        if model_name.startswith(f"{prefix}_PP-OCRv5_mobile_rec"):
+            return charset_filename
+
+    return None
+
+
+def install_converted_model(model_dir, install_dir):
+    """Install converted MNN and charset files into the runtime models directory"""
+    model_path = Path(model_dir)
+    install_path = Path(install_dir)
+    output_mnn = model_path / "model.mnn"
+
+    if not output_mnn.exists():
+        print("  [Install] skipped (model.mnn missing)")
+        return False
+
+    install_path.mkdir(parents=True, exist_ok=True)
+
+    target_mnn = install_path / f"{model_path.name}.mnn"
+    shutil.copy2(output_mnn, target_mnn)
+    installed = [target_mnn.name]
+
+    charset_source = model_path / "ppocr_keys.txt"
+    charset_filename = charset_filename_for_model(model_path.name)
+    if charset_source.exists() and charset_filename:
+        target_charset = install_path / charset_filename
+        shutil.copy2(charset_source, target_charset)
+        installed.append(target_charset.name)
+
+    print(f"  [Install] ✓ {', '.join(installed)}")
+    return True
+
+
 def convert_model(model_dir, use_fp16=True):
     """Convert single model directory"""
     model_path = Path(model_dir)
@@ -171,6 +235,9 @@ Examples:
   
   # Specify OCR directory
   python convert_paddle_to_mnn.py --ocr-dir ./my_ocr_models
+
+  # Convert and install runtime files into models/
+  python convert_paddle_to_mnn.py --ocr-dir ./my_ocr_models --install-dir ./models
   
   # Disable FP16
   python convert_paddle_to_mnn.py --no-fp16
@@ -189,6 +256,12 @@ Examples:
         action='store_true',
         help='Disable FP16 precision (default: enabled)'
     )
+
+    parser.add_argument(
+        '--install-dir',
+        type=str,
+        help='Copy converted runtime files into this models directory'
+    )
     
     args = parser.parse_args()
     
@@ -197,7 +270,10 @@ Examples:
     
     print(f"Paddle to MNN Converter")
     print(f"OCR dir: {ocr_dir.absolute()}")
-    print(f"FP16: {use_fp16}\n")
+    print(f"FP16: {use_fp16}")
+    if args.install_dir:
+        print(f"Install dir: {Path(args.install_dir).absolute()}")
+    print()
     
     if not check_dependencies():
         sys.exit(1)
@@ -221,6 +297,9 @@ Examples:
     for model_dir in sorted(model_dirs):
         try:
             results = convert_model(model_dir, use_fp16)
+
+            if args.install_dir and results['onnx_to_mnn']:
+                results['install'] = install_converted_model(model_dir, args.install_dir)
             
             if any(results.values()):
                 success_count += 1

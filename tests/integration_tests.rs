@@ -6,6 +6,7 @@
 
 use ocr_rs::{
     DetModel, DetOptions, DetPrecisionMode, OcrEngine, OcrEngineConfig, RecModel, RecOptions,
+    RecognizeOptions, RotatedTextMode,
 };
 
 /// 测试模型文件路径
@@ -13,6 +14,8 @@ const DET_MODEL_PATH: &str = "models/PP-OCRv5_mobile_det.mnn";
 const REC_MODEL_PATH: &str = "models/PP-OCRv5_mobile_rec.mnn";
 const CHARSET_PATH: &str = "models/ppocr_keys_v5.txt";
 const TEST_IMAGE_PATH: &str = "res/test1.png";
+const ROTATED_CHINESE_PAGE_PATH: &str = "tests/fixtures/rotated_chinese_page.png";
+const ISSUE_45_IMAGE_PATH: &str = "tests/fixtures/issue_45_mixed_orientation.png";
 
 /// 检查模型文件是否存在
 fn models_exist() -> bool {
@@ -24,6 +27,22 @@ fn models_exist() -> bool {
 /// 检查测试图像是否存在
 fn test_image_exists() -> bool {
     std::path::Path::new(TEST_IMAGE_PATH).exists()
+}
+
+fn rotated_chinese_page_exists() -> bool {
+    std::path::Path::new(ROTATED_CHINESE_PAGE_PATH).exists()
+}
+
+fn issue_45_fixture_exists() -> bool {
+    std::path::Path::new(ISSUE_45_IMAGE_PATH).exists()
+}
+
+fn is_rotated_text_box(points: &Option<[imageproc::point::Point<f32>; 4]>) -> bool {
+    let Some(points) = points else {
+        return false;
+    };
+
+    (points[0].y - points[1].y).abs() > 2.0 || (points[2].y - points[3].y).abs() > 2.0
 }
 
 #[test]
@@ -120,8 +139,7 @@ fn test_ocr_engine_with_config() {
         .with_det_options(DetOptions::fast())
         .with_rec_options(RecOptions::new().with_min_score(0.3));
 
-    let engine =
-        OcrEngine::new(DET_MODEL_PATH, REC_MODEL_PATH, CHARSET_PATH, Some(config));
+    let engine = OcrEngine::new(DET_MODEL_PATH, REC_MODEL_PATH, CHARSET_PATH, Some(config));
     assert!(engine.is_ok(), "配置 OCR 引擎失败: {:?}", engine.err());
 }
 
@@ -234,6 +252,141 @@ fn test_full_ocr_pipeline() {
         assert!(result.confidence >= 0.0 && result.confidence <= 1.0);
         assert!(result.bbox.area() > 0);
     }
+}
+
+#[test]
+fn test_issue_45_robust_mode_recognizes_mixed_orientation_text() {
+    if !models_exist() || !issue_45_fixture_exists() {
+        eprintln!("跳过测试：模型或 Issue #45 测试图像不存在");
+        return;
+    }
+
+    let config = OcrEngineConfig::fast().with_min_result_confidence(0.0);
+    let engine =
+        OcrEngine::new(DET_MODEL_PATH, REC_MODEL_PATH, CHARSET_PATH, Some(config)).unwrap();
+    let image = image::open(ISSUE_45_IMAGE_PATH).unwrap();
+
+    let legacy_results = engine.recognize(&image).unwrap();
+    let default_options_results = engine
+        .recognize_with_options(&image, &RecognizeOptions::default())
+        .unwrap();
+
+    let snapshot = |results: &[ocr_rs::OcrResult_]| {
+        results
+            .iter()
+            .map(|result| {
+                (
+                    result.text.clone(),
+                    result.confidence,
+                    result.bbox.rect.left(),
+                    result.bbox.rect.top(),
+                    result.bbox.rect.width(),
+                    result.bbox.rect.height(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        snapshot(&legacy_results),
+        snapshot(&default_options_results),
+        "默认按调用选项必须与原 recognize 接口完全一致"
+    );
+
+    let robust_results = engine
+        .recognize_with_options(
+            &image,
+            &RecognizeOptions::new().with_rotated_text_mode(RotatedTextMode::Robust),
+        )
+        .unwrap();
+    let robust_text = robust_results
+        .iter()
+        .map(|result| result.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    assert!(
+        robust_text.contains("内宽21.5cm"),
+        "Robust 模式应保留横向文本，实际: {robust_text:?}"
+    );
+    assert!(
+        robust_text.contains("内长28cm"),
+        "Robust 模式应识别 Issue #45 的竖向文本，实际: {robust_text:?}"
+    );
+    assert!(
+        robust_text.contains("外宽34-35cm"),
+        "Robust 模式应保留横向文本，实际: {robust_text:?}"
+    );
+
+    for (index, result) in robust_results.iter().enumerate() {
+        for other in robust_results.iter().skip(index + 1) {
+            assert!(
+                ocr_rs::postprocess::compute_iou(&result.bbox.rect, &other.bbox.rect) < 0.5,
+                "Robust 模式不应返回空间重复框: {:?} / {:?}",
+                result.text,
+                other.text
+            );
+        }
+    }
+
+    let reverse_results = engine
+        .recognize_with_options(
+            &image.rotate180(),
+            &RecognizeOptions::new().with_rotated_text_mode(RotatedTextMode::Robust),
+        )
+        .unwrap();
+    let reverse_text = reverse_results
+        .iter()
+        .map(|result| result.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        reverse_text.contains("内长28cm"),
+        "Robust 模式应同时覆盖 90° 和 270° 两个方向，实际: {reverse_text:?}"
+    );
+}
+
+#[test]
+fn test_v5_rotated_page_uses_quadrilateral_boxes() {
+    if !models_exist() || !rotated_chinese_page_exists() {
+        eprintln!("跳过测试：模型或倾斜页面测试图像不存在");
+        return;
+    }
+
+    let config = OcrEngineConfig::fast().with_min_result_confidence(0.7);
+    let engine =
+        OcrEngine::new(DET_MODEL_PATH, REC_MODEL_PATH, CHARSET_PATH, Some(config)).unwrap();
+    let image = image::open(ROTATED_CHINESE_PAGE_PATH).unwrap();
+
+    let results = engine
+        .recognize(&image)
+        .unwrap_or_else(|e| panic!("倾斜中文页 OCR 识别失败: {:?}", e));
+
+    assert!(
+        results.len() >= 20,
+        "v5 倾斜中文页应该识别出大量文本行，实际: {}",
+        results.len()
+    );
+
+    let quadrilateral_count = results
+        .iter()
+        .filter(|result| result.bbox.points.is_some())
+        .count();
+    assert_eq!(
+        quadrilateral_count,
+        results.len(),
+        "所有检测框都应该保留四点坐标"
+    );
+
+    let rotated_count = results
+        .iter()
+        .filter(|result| is_rotated_text_box(&result.bbox.points))
+        .count();
+    assert!(
+        rotated_count >= 20,
+        "大部分文本行应该是非水平四点框，实际斜框数: {} / {}",
+        rotated_count,
+        results.len()
+    );
 }
 
 #[test]

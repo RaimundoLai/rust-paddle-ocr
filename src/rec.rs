@@ -2,12 +2,16 @@
 //!
 //! Provides text recognition functionality based on PaddleOCR recognition models
 
-use image::DynamicImage;
-use ndarray::ArrayD;
-use std::path::Path;
+use image::{DynamicImage, RgbImage};
+use imageproc::geometric_transformations::Projection;
+use imageproc::point::Point;
+use ndarray::{Array4, ArrayD, ArrayViewD, Axis};
+use rayon::prelude::*;
+use std::{borrow::Cow, path::Path};
 
 use crate::error::{OcrError, OcrResult};
 use crate::mnn::{InferenceConfig, InferenceEngine};
+use crate::postprocess::TextBox;
 use crate::preprocess::{preprocess_for_rec, NormalizeParams};
 
 /// Recognition result
@@ -19,6 +23,46 @@ pub struct RecognitionResult {
     pub confidence: f32,
     /// Confidence score for each character
     pub char_scores: Vec<(char, f32)>,
+}
+
+/// A recognized character and its horizontal position within the rectified
+/// text-line image.
+///
+/// `start` and `end` are normalized to `0.0..=1.0`, measured from the start of
+/// the recognition direction. They are derived from the model's CTC time-step
+/// alignment rather than from uniformly dividing the final string.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CharacterSpan {
+    /// Recognized Unicode scalar value.
+    pub character: char,
+    /// Confidence score emitted for this character.
+    pub confidence: f32,
+    /// Inclusive visual start, normalized to the rectified line width.
+    pub start: f32,
+    /// Exclusive visual end, normalized to the rectified line width.
+    pub end: f32,
+}
+
+/// Text recognition result with per-character CTC alignment.
+///
+/// This is a separate result type so adding alignment remains source
+/// compatible with code that constructs or destructures [`RecognitionResult`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlignedRecognitionResult {
+    /// Recognized text.
+    pub text: String,
+    /// Average confidence score (0.0 - 1.0).
+    pub confidence: f32,
+    /// Confidence score for each character.
+    pub char_scores: Vec<(char, f32)>,
+    /// Character positions in the same order as `text`.
+    pub characters: Vec<CharacterSpan>,
+}
+
+impl AlignedRecognitionResult {
+    fn into_legacy(self) -> RecognitionResult {
+        RecognitionResult::new(self.text, self.confidence, self.char_scores)
+    }
 }
 
 impl RecognitionResult {
@@ -233,6 +277,16 @@ impl RecModel {
     /// # Returns
     /// Recognition result
     pub fn recognize(&self, image: &DynamicImage) -> OcrResult<RecognitionResult> {
+        self.recognize_with_alignment(image)
+            .map(AlignedRecognitionResult::into_legacy)
+    }
+
+    /// Recognize a single text-line image and retain per-character CTC
+    /// alignment. Existing callers can continue using [`Self::recognize`].
+    pub fn recognize_with_alignment(
+        &self,
+        image: &DynamicImage,
+    ) -> OcrResult<AlignedRecognitionResult> {
         // Preprocess
         let input = preprocess_for_rec(image, self.options.target_height, &self.normalize_params)?;
 
@@ -240,7 +294,7 @@ impl RecModel {
         let output = self.engine.run_dynamic(input.view().into_dyn())?;
 
         // Decode
-        self.decode_output(&output)
+        self.decode_output_view_with_alignment(output.view(), 1.0)
     }
 
     /// Recognize a single image, return text only
@@ -310,6 +364,169 @@ impl RecModel {
         Ok(results)
     }
 
+    pub(crate) fn recognize_regions(
+        &self,
+        image: &DynamicImage,
+        boxes: &[TextBox],
+    ) -> OcrResult<Vec<RecognitionResult>> {
+        self.recognize_regions_with_alignment(image, boxes)
+            .map(|results| {
+                results
+                    .into_iter()
+                    .map(AlignedRecognitionResult::into_legacy)
+                    .collect()
+            })
+    }
+
+    pub(crate) fn recognize_regions_with_alignment(
+        &self,
+        image: &DynamicImage,
+        boxes: &[TextBox],
+    ) -> OcrResult<Vec<AlignedRecognitionResult>> {
+        if boxes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let source = image.to_rgb8();
+        let mut results = Vec::with_capacity(boxes.len());
+        let batch_size = self.options.batch_size.max(1);
+
+        for chunk in boxes.chunks(batch_size) {
+            let batch_input = self.preprocess_regions_batch(&source, chunk)?;
+            let input_width = batch_input.shape()[3].max(1) as f32;
+            let batch_output = self.engine.run_dynamic(batch_input.view().into_dyn())?;
+
+            let shape = batch_output.shape();
+            if shape.len() != 3 {
+                return Err(OcrError::PostprocessError(format!(
+                    "Region batch inference output shape error: {:?}",
+                    shape
+                )));
+            }
+
+            for (i, text_box) in chunk.iter().take(shape[0]).enumerate() {
+                let sample_output = batch_output.index_axis(Axis(0), i).into_dyn();
+                let valid_width = region_target_width(text_box, self.options.target_height) as f32;
+                results.push(self.decode_output_view_with_alignment(
+                    sample_output,
+                    (valid_width / input_width).clamp(0.0, 1.0),
+                )?);
+            }
+        }
+
+        Ok(results)
+    }
+
+    pub(crate) fn recognize_regions_exact_parallel(
+        &self,
+        image: &DynamicImage,
+        boxes: &[TextBox],
+    ) -> OcrResult<Vec<RecognitionResult>> {
+        self.recognize_regions_exact_parallel_with_alignment(image, boxes)
+            .map(|results| {
+                results
+                    .into_iter()
+                    .map(AlignedRecognitionResult::into_legacy)
+                    .collect()
+            })
+    }
+
+    pub(crate) fn recognize_regions_exact_parallel_with_alignment(
+        &self,
+        image: &DynamicImage,
+        boxes: &[TextBox],
+    ) -> OcrResult<Vec<AlignedRecognitionResult>> {
+        if boxes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let source = image.to_rgb8();
+        boxes
+            .par_iter()
+            .map(|text_box| {
+                let input =
+                    self.preprocess_regions_batch(&source, std::slice::from_ref(text_box))?;
+                let output = self.engine.run_dynamic(input.view().into_dyn())?;
+                self.decode_output_view_with_alignment(output.view(), 1.0)
+            })
+            .collect()
+    }
+
+    fn preprocess_regions_batch(
+        &self,
+        source: &RgbImage,
+        boxes: &[TextBox],
+    ) -> OcrResult<Array4<f32>> {
+        if boxes.is_empty() {
+            return Ok(Array4::<f32>::zeros((
+                0,
+                3,
+                self.options.target_height as usize,
+                0,
+            )));
+        }
+
+        if self.options.target_height == 0 {
+            return Err(OcrError::InvalidParameter(
+                "Recognition target height must be greater than 0".into(),
+            ));
+        }
+
+        let target_height = self.options.target_height;
+        let target_widths = boxes
+            .iter()
+            .map(|text_box| region_target_width(text_box, target_height))
+            .collect::<Vec<_>>();
+        let max_width = target_widths.iter().copied().max().unwrap_or(1) as usize;
+        let batch_size = boxes.len();
+        let target_height_usize = target_height as usize;
+        let sample_size = 3 * target_height_usize * max_width;
+        let plane_size = target_height_usize * max_width;
+
+        let mut batch = Array4::<f32>::zeros((batch_size, 3, target_height_usize, max_width));
+        let data = batch
+            .as_slice_mut()
+            .expect("Array4 created by zeros should be contiguous");
+        let scales = [
+            1.0 / (255.0 * self.normalize_params.std[0]),
+            1.0 / (255.0 * self.normalize_params.std[1]),
+            1.0 / (255.0 * self.normalize_params.std[2]),
+        ];
+        let offsets = [
+            -self.normalize_params.mean[0] / self.normalize_params.std[0],
+            -self.normalize_params.mean[1] / self.normalize_params.std[1],
+            -self.normalize_params.mean[2] / self.normalize_params.std[2],
+        ];
+
+        for (i, (text_box, &target_width)) in boxes.iter().zip(target_widths.iter()).enumerate() {
+            let projection =
+                target_to_source_projection(source, text_box, target_width, target_height)
+                    .ok_or_else(|| {
+                        OcrError::PreprocessError(format!(
+                            "Failed to render recognition region: {:?}",
+                            text_box.rect
+                        ))
+                    })?;
+            let target_width = target_width as usize;
+            let sample_offset = i * sample_size;
+
+            write_projected_region_to_tensor(
+                source,
+                projection,
+                target_width,
+                target_height_usize,
+                max_width,
+                sample_offset,
+                plane_size,
+                data,
+                &scales,
+                &offsets,
+            );
+        }
+
+        Ok(batch)
+    }
+
     /// Internal batch recognition
     fn recognize_batch_internal(
         &self,
@@ -347,19 +564,29 @@ impl RecModel {
         let mut results = Vec::with_capacity(batch_size);
 
         for i in 0..batch_size {
-            // Extract output for single sample
-            let sample_output = batch_output.slice(ndarray::s![i, .., ..]).to_owned();
-            let sample_output_dyn = sample_output.into_dyn();
-            let result = self.decode_output(&sample_output_dyn)?;
+            let sample_output = batch_output.index_axis(Axis(0), i).into_dyn();
+            let result = self.decode_output_view(sample_output)?;
             results.push(result);
         }
 
         Ok(results)
     }
 
-    /// Decode model output
-    fn decode_output(&self, output: &ArrayD<f32>) -> OcrResult<RecognitionResult> {
+    fn decode_output_view(&self, output: ArrayViewD<'_, f32>) -> OcrResult<RecognitionResult> {
+        self.decode_output_view_with_alignment(output, 1.0)
+            .map(AlignedRecognitionResult::into_legacy)
+    }
+
+    fn decode_output_view_with_alignment(
+        &self,
+        output: ArrayViewD<'_, f32>,
+        valid_width_ratio: f32,
+    ) -> OcrResult<AlignedRecognitionResult> {
         let shape = output.shape();
+        let output_data = match output.as_slice_memory_order() {
+            Some(slice) => Cow::Borrowed(slice),
+            None => Cow::Owned(output.iter().copied().collect()),
+        };
 
         // Output shape should be [batch, seq_len, num_classes] or [seq_len, num_classes]
         let (seq_len, num_classes) = if shape.len() == 3 {
@@ -373,10 +600,17 @@ impl RecModel {
             )));
         };
 
-        let output_data: Vec<f32> = output.iter().cloned().collect();
+        if num_classes == 0 {
+            return Err(OcrError::PostprocessError(
+                "Invalid output shape with zero classes".into(),
+            ));
+        }
 
         // CTC decoding
-        let mut char_scores = Vec::new();
+        let mut char_scores = Vec::with_capacity(seq_len.min(32));
+        let mut character_timesteps = Vec::with_capacity(seq_len.min(32));
+        let mut text = String::new();
+        let mut score_sum = 0.0f32;
         let mut prev_idx = 0usize;
 
         for t in 0..seq_len {
@@ -385,33 +619,40 @@ impl RecModel {
             let end = start + num_classes;
             let probs = &output_data[start..end];
 
-            let (max_idx, &max_prob) = probs
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .ok_or_else(|| {
-                    OcrError::PostprocessError("Empty probability slice in CTC decoding".into())
-                })?;
+            let mut max_idx = 0usize;
+            let mut max_prob = f32::NEG_INFINITY;
+            for (idx, &prob) in probs.iter().enumerate() {
+                if !prob.is_finite() {
+                    return Err(OcrError::PostprocessError(format!(
+                        "Non-finite recognition score at timestep {t}, class {idx}; check GPU precision (try High) and compare with CPU"
+                    )));
+                }
+                if prob > max_prob {
+                    max_idx = idx;
+                    max_prob = prob;
+                }
+            }
 
             // CTC decoding rule: skip blank (index 0) and duplicate characters
-            if max_idx != 0 && max_idx != prev_idx {
-                if max_idx < self.charset.len() {
-                    let ch = self.charset[max_idx];
+            if max_idx != 0 && max_idx != prev_idx && max_idx < self.charset.len() {
+                let ch = self.charset[max_idx];
 
-                    // Use raw logit value as confidence (model output is already softmax probability)
-                    // For large character sets, softmax scores can be very small, so use max_prob directly
-                    let score = max_prob;
+                // Use raw logit value as confidence (model output is already softmax probability)
+                // For large character sets, softmax scores can be very small, so use max_prob directly
+                let score = max_prob;
 
-                    // Only filter out very low confidence characters
-                    let threshold = if Self::is_punctuation(ch) {
-                        self.options.punct_min_score
-                    } else {
-                        self.options.min_score
-                    };
+                // Only filter out very low confidence characters
+                let threshold = if Self::is_punctuation(ch) {
+                    self.options.punct_min_score
+                } else {
+                    self.options.min_score
+                };
 
-                    if score >= threshold {
-                        char_scores.push((ch, score));
-                    }
+                if score >= threshold {
+                    text.push(ch);
+                    score_sum += score;
+                    char_scores.push((ch, score));
+                    character_timesteps.push(t);
                 }
             }
 
@@ -422,19 +663,319 @@ impl RecModel {
         let confidence = if char_scores.is_empty() {
             0.0
         } else {
-            char_scores.iter().map(|(_, s)| s).sum::<f32>() / char_scores.len() as f32
+            score_sum / char_scores.len() as f32
         };
 
-        // Extract text
-        let text: String = char_scores.iter().map(|(ch, _)| ch).collect();
+        let valid_timestep_count = ((seq_len as f32 * valid_width_ratio.clamp(0.0, 1.0)).ceil()
+            as usize)
+            .clamp(1, seq_len.max(1));
+        let characters =
+            aligned_character_spans(&char_scores, &character_timesteps, valid_timestep_count);
 
-        Ok(RecognitionResult::new(text, confidence, char_scores))
+        Ok(AlignedRecognitionResult {
+            text,
+            confidence,
+            char_scores,
+            characters,
+        })
     }
 
     /// Check if character is punctuation
     fn is_punctuation(ch: char) -> bool {
         PUNCTUATIONS.contains(&ch)
     }
+}
+
+fn aligned_character_spans(
+    char_scores: &[(char, f32)],
+    timesteps: &[usize],
+    valid_timestep_count: usize,
+) -> Vec<CharacterSpan> {
+    if char_scores.is_empty() || char_scores.len() != timesteps.len() {
+        return Vec::new();
+    }
+
+    let valid_timestep_count = valid_timestep_count.max(1);
+    let denominator = valid_timestep_count as f32;
+    let centers = timesteps
+        .iter()
+        .map(|timestep| (*timestep).min(valid_timestep_count - 1) as f32 + 0.5)
+        .collect::<Vec<_>>();
+
+    char_scores
+        .iter()
+        .enumerate()
+        .map(|(index, &(character, confidence))| {
+            let start = if index == 0 {
+                0.0
+            } else {
+                (centers[index - 1] + centers[index]) * 0.5 / denominator
+            };
+            let end = if index + 1 == centers.len() {
+                1.0
+            } else {
+                (centers[index] + centers[index + 1]) * 0.5 / denominator
+            };
+            CharacterSpan {
+                character,
+                confidence,
+                start: start.clamp(0.0, 1.0),
+                end: end.clamp(0.0, 1.0),
+            }
+        })
+        .collect()
+}
+
+fn region_target_width(text_box: &TextBox, target_height: u32) -> u32 {
+    let (width, height) = region_dimensions(text_box);
+    ((width / height.max(1.0)) * target_height as f32)
+        .round()
+        .max(2.0) as u32
+}
+
+fn target_to_source_projection(
+    source: &RgbImage,
+    text_box: &TextBox,
+    target_width: u32,
+    target_height: u32,
+) -> Option<Projection> {
+    if target_width < 2 || target_height < 2 {
+        return None;
+    }
+
+    if let Some(source_points) =
+        source_points_for_text_box(text_box, source.width(), source.height())
+    {
+        if let Some(projection) =
+            build_target_to_source_projection(source_points, target_width, target_height)
+        {
+            return Some(projection);
+        }
+    }
+
+    let source_points = rect_source_points_for_text_box(text_box, source.width(), source.height())?;
+    build_target_to_source_projection(source_points, target_width, target_height)
+}
+
+fn build_target_to_source_projection(
+    source_points: [(f32, f32); 4],
+    target_width: u32,
+    target_height: u32,
+) -> Option<Projection> {
+    let target_points = [
+        (0.0, 0.0),
+        (target_width.saturating_sub(1) as f32, 0.0),
+        (
+            target_width.saturating_sub(1) as f32,
+            target_height.saturating_sub(1) as f32,
+        ),
+        (0.0, target_height.saturating_sub(1) as f32),
+    ];
+
+    Projection::from_control_points(source_points, target_points)
+        .map(|projection| projection.invert())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_projected_region_to_tensor(
+    source: &RgbImage,
+    target_to_source: Projection,
+    target_width: usize,
+    target_height: usize,
+    max_width: usize,
+    sample_offset: usize,
+    plane_size: usize,
+    data: &mut [f32],
+    scales: &[f32; 3],
+    offsets: &[f32; 3],
+) {
+    let source_width = source.width() as usize;
+    let source_height = source.height() as usize;
+    let source_data = source.as_raw();
+
+    for y in 0..target_height {
+        let dst_row = y * max_width;
+
+        for x in 0..target_width {
+            let (source_x, source_y) = target_to_source * (x as f32, y as f32);
+            let dst = sample_offset + dst_row + x;
+            write_normalized_sample(
+                source_data,
+                source_width,
+                source_height,
+                source_x,
+                source_y,
+                data,
+                dst,
+                sample_offset + plane_size + dst_row + x,
+                sample_offset + plane_size * 2 + dst_row + x,
+                scales,
+                offsets,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn write_normalized_sample(
+    source_data: &[u8],
+    source_width: usize,
+    source_height: usize,
+    x: f32,
+    y: f32,
+    data: &mut [f32],
+    dst_r: usize,
+    dst_g: usize,
+    dst_b: usize,
+    scales: &[f32; 3],
+    offsets: &[f32; 3],
+) {
+    let left = x.floor();
+    let right = left + 1.0;
+    let top = y.floor();
+    let bottom = top + 1.0;
+
+    if !(left >= 0.0 && right < source_width as f32 && top >= 0.0 && bottom < source_height as f32)
+    {
+        data[dst_r] = 255.0 * scales[0] + offsets[0];
+        data[dst_g] = 255.0 * scales[1] + offsets[1];
+        data[dst_b] = 255.0 * scales[2] + offsets[2];
+        return;
+    }
+
+    let right_weight = x - left;
+    let bottom_weight = y - top;
+    let left = left as usize;
+    let right = right as usize;
+    let top = top as usize;
+    let bottom = bottom as usize;
+    let top_left = (top * source_width + left) * 3;
+    let top_right = (top * source_width + right) * 3;
+    let bottom_left = (bottom * source_width + left) * 3;
+    let bottom_right = (bottom * source_width + right) * 3;
+
+    let r = bilinear_channel(
+        source_data[top_left],
+        source_data[top_right],
+        source_data[bottom_left],
+        source_data[bottom_right],
+        right_weight,
+        bottom_weight,
+    );
+    let g = bilinear_channel(
+        source_data[top_left + 1],
+        source_data[top_right + 1],
+        source_data[bottom_left + 1],
+        source_data[bottom_right + 1],
+        right_weight,
+        bottom_weight,
+    );
+    let b = bilinear_channel(
+        source_data[top_left + 2],
+        source_data[top_right + 2],
+        source_data[bottom_left + 2],
+        source_data[bottom_right + 2],
+        right_weight,
+        bottom_weight,
+    );
+
+    data[dst_r] = r as f32 * scales[0] + offsets[0];
+    data[dst_g] = g as f32 * scales[1] + offsets[1];
+    data[dst_b] = b as f32 * scales[2] + offsets[2];
+}
+
+#[inline(always)]
+fn bilinear_channel(
+    top_left: u8,
+    top_right: u8,
+    bottom_left: u8,
+    bottom_right: u8,
+    right_weight: f32,
+    bottom_weight: f32,
+) -> u8 {
+    let top = lerp(top_left as f32, top_right as f32, right_weight);
+    let bottom = lerp(bottom_left as f32, bottom_right as f32, right_weight);
+    clamp_to_u8(lerp(top, bottom, bottom_weight))
+}
+
+#[inline]
+fn lerp(left: f32, right: f32, weight: f32) -> f32 {
+    (1.0 - weight) * left + weight * right
+}
+
+#[inline]
+fn clamp_to_u8(value: f32) -> u8 {
+    if value < u8::MAX as f32 {
+        if value > u8::MIN as f32 {
+            value as u8
+        } else {
+            u8::MIN
+        }
+    } else {
+        u8::MAX
+    }
+}
+
+fn source_points_for_text_box(
+    text_box: &TextBox,
+    image_width: u32,
+    image_height: u32,
+) -> Option<[(f32, f32); 4]> {
+    if let Some(points) = text_box.points {
+        let max_x = image_width.saturating_sub(1) as f32;
+        let max_y = image_height.saturating_sub(1) as f32;
+        return Some(points.map(|point| (point.x.clamp(0.0, max_x), point.y.clamp(0.0, max_y))));
+    }
+
+    rect_source_points_for_text_box(text_box, image_width, image_height)
+}
+
+fn rect_source_points_for_text_box(
+    text_box: &TextBox,
+    image_width: u32,
+    image_height: u32,
+) -> Option<[(f32, f32); 4]> {
+    let left = text_box.rect.left().max(0) as u32;
+    let top = text_box.rect.top().max(0) as u32;
+    let right = left
+        .saturating_add(text_box.rect.width())
+        .min(image_width)
+        .saturating_sub(1);
+    let bottom = top
+        .saturating_add(text_box.rect.height())
+        .min(image_height)
+        .saturating_sub(1);
+
+    if right <= left || bottom <= top {
+        return None;
+    }
+
+    Some([
+        (left as f32, top as f32),
+        (right as f32, top as f32),
+        (right as f32, bottom as f32),
+        (left as f32, bottom as f32),
+    ])
+}
+
+fn region_dimensions(text_box: &TextBox) -> (f32, f32) {
+    if let Some(points) = text_box.points {
+        let width = distance(points[0], points[1]).max(distance(points[3], points[2]));
+        let height = distance(points[0], points[3]).max(distance(points[1], points[2]));
+        (width.max(1.0), height.max(1.0))
+    } else {
+        (
+            text_box.rect.width().max(1) as f32,
+            text_box.rect.height().max(1) as f32,
+        )
+    }
+}
+
+fn distance(a: Point<f32>, b: Point<f32>) -> f32 {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    (dx * dx + dy * dy).sqrt()
 }
 
 /// Low-level recognition API
@@ -476,6 +1017,26 @@ impl RecModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(not(feature = "docsrs"))]
+    fn non_finite_gpu_scores_are_reported_instead_of_decoded() {
+        let model = RecModel::from_bytes_with_charset(
+            include_bytes!("mnn/fixtures/layout_identity.mnn"),
+            b"A\nB\n",
+            None,
+        )
+        .unwrap();
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let output = ndarray::Array::from_shape_vec((1, 1, 4), vec![0.0, value, 0.1, 0.0])
+                .unwrap()
+                .into_dyn();
+            let error = model
+                .decode_output_view_with_alignment(output.view(), 1.0)
+                .unwrap_err();
+            assert!(error.to_string().contains("Non-finite recognition score"));
+        }
+    }
 
     #[test]
     fn test_rec_options_default() {
@@ -548,6 +1109,42 @@ mod tests {
         assert!(result.text.is_empty());
         assert_eq!(result.confidence, 0.0);
         assert!(!result.is_valid(0.1));
+    }
+
+    #[test]
+    fn ctc_timesteps_partition_the_visual_line_at_character_midpoints() {
+        let scores = vec![('A', 0.9), ('中', 0.8), ('3', 0.95)];
+        let spans = aligned_character_spans(&scores, &[1, 4, 8], 10);
+
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].character, 'A');
+        assert_eq!(spans[0].start, 0.0);
+        assert!((spans[0].end - 0.3).abs() < f32::EPSILON);
+        assert!((spans[1].start - 0.3).abs() < f32::EPSILON);
+        assert!((spans[1].end - 0.65).abs() < f32::EPSILON);
+        assert!((spans[2].start - 0.65).abs() < f32::EPSILON);
+        assert_eq!(spans[2].end, 1.0);
+    }
+
+    #[test]
+    fn ctc_alignment_stays_empty_when_no_characters_are_emitted() {
+        assert!(aligned_character_spans(&[], &[], 12).is_empty());
+    }
+
+    #[test]
+    fn test_region_target_width_avoids_projection_degenerate_width() {
+        let text_box = TextBox::with_points(
+            imageproc::rect::Rect::at(747, 14).of_size(61, 1695),
+            0.9,
+            [
+                Point::new(747.0, 14.0),
+                Point::new(747.4, 14.0),
+                Point::new(747.4, 1709.0),
+                Point::new(747.0, 1709.0),
+            ],
+        );
+
+        assert_eq!(region_target_width(&text_box, 48), 2);
     }
 
     #[test]

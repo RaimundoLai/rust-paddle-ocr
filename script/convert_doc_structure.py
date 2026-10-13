@@ -12,7 +12,8 @@ Produces the files expected by `ocr_rs::structure`:
 Models whose official export contains control flow (SLANet's decode loop, FormulaNet's
 generation loop) are split into an encoder and a single decode step; the loop runs in Rust.
 
-Requirements (use the converter version that matches the MNN runtime, 3.4.1):
+Requirements (verified with the MNN 3.4.1 converter; models run on the MNN 3.6.1 runtime
+that ocr-rs links through mnn-runtime):
   pip install "MNN==3.4.1" onnx onnxruntime onnxsim huggingface_hub
   # formula only:
   pip install torch "transformers>=5.19" safetensors
