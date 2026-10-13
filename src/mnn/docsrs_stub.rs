@@ -229,6 +229,109 @@ impl InferenceEngine {
     }
 }
 
+// ============== Multi-Tensor Model ==============
+
+/// Element data of a model output tensor
+#[derive(Debug, Clone, PartialEq)]
+pub enum TensorData {
+    /// 32-bit float elements
+    F32(Vec<f32>),
+    /// 32-bit integer elements
+    I32(Vec<i32>),
+}
+
+/// Model output tensor with its shape
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tensor {
+    /// Tensor shape
+    pub shape: Vec<usize>,
+    /// Tensor elements in row-major order
+    pub data: TensorData,
+}
+
+impl Tensor {
+    /// Number of elements
+    pub fn len(&self) -> usize {
+        match &self.data {
+            TensorData::F32(v) => v.len(),
+            TensorData::I32(v) => v.len(),
+        }
+    }
+
+    /// Whether the tensor has no elements
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Borrow float elements
+    pub fn as_f32(&self) -> Option<&[f32]> {
+        unimplemented!()
+    }
+
+    /// Borrow integer elements
+    pub fn as_i32(&self) -> Option<&[i32]> {
+        unimplemented!()
+    }
+
+    /// Elements converted to f32
+    pub fn to_f32_vec(&self) -> Vec<f32> {
+        unimplemented!()
+    }
+
+    /// Convert into an f32 ndarray
+    pub fn into_f32_array(self) -> Result<ArrayD<f32>> {
+        unimplemented!()
+    }
+}
+
+/// MNN model with several named inputs and outputs (stub)
+pub struct MultiModel {
+    _input_names: Vec<String>,
+    _output_names: Vec<String>,
+}
+
+impl MultiModel {
+    /// Create a model from bytes
+    pub fn from_buffer(
+        _model_buffer: &[u8],
+        _input_names: &[&str],
+        _output_names: &[&str],
+        _config: Option<InferenceConfig>,
+    ) -> Result<Self> {
+        unimplemented!("MNN is not available in docs.rs build environment")
+    }
+
+    /// Create a model from a file
+    pub fn from_file(
+        _model_path: impl AsRef<Path>,
+        _input_names: &[&str],
+        _output_names: &[&str],
+        _config: Option<InferenceConfig>,
+    ) -> Result<Self> {
+        unimplemented!("MNN is not available in docs.rs build environment")
+    }
+
+    /// Input names in call order
+    pub fn input_names(&self) -> &[String] {
+        &self._input_names
+    }
+
+    /// Output names in result order
+    pub fn output_names(&self) -> &[String] {
+        &self._output_names
+    }
+
+    /// Run inference with inputs in input order
+    pub fn run(&self, _inputs: &[ArrayViewD<f32>]) -> Result<Vec<Tensor>> {
+        unimplemented!()
+    }
+
+    /// Run inference with named inputs
+    pub fn run_named(&self, _inputs: &[(&str, ArrayViewD<f32>)]) -> Result<Vec<Tensor>> {
+        unimplemented!()
+    }
+}
+
 // ============== Helper Functions ==============
 
 /// Get MNN version

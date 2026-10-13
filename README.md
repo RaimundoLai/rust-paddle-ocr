@@ -594,6 +594,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 For more complete examples, please refer to the [examples](../examples) directory.
 
+## Document Structure Analysis
+
+The `ocr_rs::structure` module ports PaddleOCR's document parsing models (PP-StructureV3 / PaddleOCR-VL layout stage) to MNN:
+
+| Stage | Model | Output |
+|---|---|---|
+| Layout + reading order | PP-DocLayoutV3 (25 classes, predicted order, polygons) or PP-DocLayout_plus-L (20 classes, XY-cut order) | `LayoutRegion` list |
+| Table | SLANet_plus (+ optional PP-LCNet table classifier and RT-DETR-L cell detectors) | HTML with recognized text |
+| Formula | PP-FormulaNet_plus-L | LaTeX |
+| Unwarping | UVDoc | rectified page image |
+
+### Convert the models
+
+Only the converter that matches the bundled MNN runtime (3.4.1) is supported:
+
+```bash
+pip install "MNN==3.4.1" onnx onnxruntime onnxsim huggingface_hub
+pip install torch "transformers>=5.19" safetensors   # formula model only
+python script/convert_doc_structure.py --output models/structure
+```
+
+SLANet and PP-FormulaNet are autoregressive. Their official exports contain loops that MNN cannot execute, so the script splits each into an encoder and a single decode step, and the decode loop runs in Rust. Use `--components layout,table` to convert a subset.
+
+### Analyze a page
+
+```rust
+use ocr_rs::structure::*;
+use ocr_rs::OcrEngine;
+
+let dir = std::path::Path::new("models/structure");
+let layout = LayoutModel::from_file(dir.join("PP-DocLayoutV3.mnn"), LayoutModelType::DocLayoutV3, None)?;
+let table = TableRecognizer::new(TableStructureModel::from_files(
+    dir.join("SLANet_plus_encoder.mnn"),
+    dir.join("SLANet_plus_step.mnn"),
+    None,
+)?);
+let formula = FormulaModel::from_files(
+    dir.join("PP-FormulaNet_plus-L_encoder.mnn"),
+    dir.join("PP-FormulaNet_plus-L_decoder.mnn"),
+    dir.join("PP-FormulaNet_plus-L_vocab.txt"),
+    None,
+)?;
+let engine = DocStructureEngine::new(layout)
+    .with_ocr(OcrEngine::new("models/PP-OCRv5_mobile_det.mnn", "models/PP-OCRv5_mobile_rec.mnn", "models/ppocr_keys_v5.txt", None)?)
+    .with_table(table)
+    .with_formula(formula);
+
+let result = engine.analyze(&image::open("page.png")?)?;
+for block in &result.blocks {
+    println!("{:?} {:?} {:?}", block.order, block.label, block.content);
+}
+println!("{}", result.to_markdown());
+```
+
+Every stage is optional, and each model can also be used on its own (`LayoutModel::detect`, `TableStructureModel::predict`, `FormulaModel::recognize`, `DocUnwarpModel::unwarp`). Models with several inputs or outputs run through `MultiModel`, which uses MNN's Module API (named tensors, dynamic shapes, int32 outputs).
+
+Command-line example: `cargo run --release --example doc_structure -- page.png --models models/structure [--unwarp] [--table-cells]`.
+
+Differences from PaddleX:
+- Images are resized with the `image` crate, not OpenCV, so tensors are not bit-identical.
+- PP-DocLayout_plus-L uses a recursive XY-cut instead of `xycut_enhanced`.
+- Table cell detection replaces the predicted cell boxes only when the detected cell count matches the structure. PaddleX's KMeans cell reprocessing is not ported.
+- SLANeXt (wired tables) is not included.
+
+To run the model-backed tests, set `OCR_RS_STRUCTURE_MODELS` to the converted models and `OCR_RS_STRUCTURE_IMAGES` to a folder with the PaddleX demo images (`layout.jpg`, `table_recognition.jpg`, `general_formula_rec_001.png`, `doc_test.jpg`). Then run `cargo test --release --test structure_models`.
+
 ## Related Projects
 
 - 🖥️ **[newbee-ocr-cli](https://github.com/zibo-chen/newbee-ocr-cli)** - A command-line tool based on this library, providing a simple and easy-to-use OCR CLI interface.

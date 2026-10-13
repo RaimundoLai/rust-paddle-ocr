@@ -89,6 +89,7 @@
 //! - [`engine`]: High-level OCR pipeline ([`OcrEngine`]), all-in-one OCR solution
 //! - [`preprocess`]: Image preprocessing utilities, including normalization, scaling, etc.
 //! - [`postprocess`]: Post-processing utilities, including NMS, box merging, sorting, etc.
+//! - [`structure`]: Document structure analysis (layout, reading order, tables, formulas, unwarping)
 //! - [`error`]: Error types [`OcrError`]
 //!
 //! ## API Hierarchy
@@ -120,6 +121,7 @@ pub mod mnn;
 pub mod postprocess;
 pub mod preprocess;
 pub mod rec;
+pub mod structure;
 mod ori;
 
 // Re-export commonly used types
@@ -129,7 +131,7 @@ pub use engine::{
     RecOnlyEngine,
 };
 pub use error::{OcrError, OcrResult};
-pub use mnn::{Backend, InferenceConfig, InferenceEngine, PrecisionMode};
+pub use mnn::{Backend, InferenceConfig, InferenceEngine, MultiModel, PrecisionMode};
 pub use postprocess::TextBox;
 pub use ori::{OriModel, OriOptions, OriPreprocessMode, OrientationResult};
 pub use rec::{RecModel, RecOptions, RecognitionResult};

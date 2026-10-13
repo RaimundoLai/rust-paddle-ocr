@@ -175,6 +175,77 @@ extern "C"
     // Free output buffer allocated by mnnr_run_inference_dynamic
     void mnnr_free_output(float *output_data);
 
+    // ============== Multi-Tensor Module API ==============
+    //
+    // Built on MNN::Express::Module. Supports models with several named inputs and
+    // outputs, dynamic input shapes per call, control flow, and int32 outputs.
+
+    typedef struct MNN_Module MNN_Module;
+
+    // Element type of an output tensor
+    typedef enum
+    {
+        MNNR_DTYPE_FLOAT32 = 0,
+        MNNR_DTYPE_INT32 = 1
+    } MNNR_DataType;
+
+    // Input tensor description (float32, row-major dims)
+    typedef struct
+    {
+        const float *data;
+        const int32_t *dims;
+        size_t ndims;
+    } MNNR_InputTensor;
+
+    // Output tensor owned by the wrapper; release with mnnr_module_free_outputs
+    typedef struct
+    {
+        int32_t dtype; // MNNR_DataType
+        void *data;
+        size_t element_count;
+        int32_t dims[8];
+        size_t ndims;
+    } MNNR_OutputTensor;
+
+    // Create a module from a model buffer.
+    // input_names/output_names select and order the model tensors. When a list is
+    // empty (count 0), the model's declared inputs/outputs are used.
+    // error_buffer (optional) receives a message when NULL is returned.
+    MNN_Module *mnnr_module_create(
+        const void *buffer,
+        size_t size,
+        const char *const *input_names,
+        size_t num_inputs,
+        const char *const *output_names,
+        size_t num_outputs,
+        const MNNR_Config *config,
+        char *error_buffer,
+        size_t error_buffer_size);
+
+    // Destroy a module
+    void mnnr_module_destroy(MNN_Module *module);
+
+    // Number of inputs/outputs and their names (valid until the module is destroyed)
+    size_t mnnr_module_input_count(const MNN_Module *module);
+    size_t mnnr_module_output_count(const MNN_Module *module);
+    const char *mnnr_module_input_name(const MNN_Module *module, size_t index);
+    const char *mnnr_module_output_name(const MNN_Module *module, size_t index);
+
+    // Run the module. inputs follow the module input order; outputs must have room for
+    // mnnr_module_output_count() entries. Thread-safe (serialized).
+    MNNR_ErrorCode mnnr_module_forward(
+        MNN_Module *module,
+        const MNNR_InputTensor *inputs,
+        size_t num_inputs,
+        MNNR_OutputTensor *outputs,
+        size_t num_outputs);
+
+    // Free the data buffers of outputs filled by mnnr_module_forward
+    void mnnr_module_free_outputs(MNNR_OutputTensor *outputs, size_t num_outputs);
+
+    // Get last error message from module
+    const char *mnnr_module_get_last_error(const MNN_Module *module);
+
 #ifdef __cplusplus
 }
 #endif

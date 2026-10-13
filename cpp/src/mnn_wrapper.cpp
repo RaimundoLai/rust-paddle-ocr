@@ -2,7 +2,11 @@
 #include <MNN/Interpreter.hpp>
 #include <MNN/Tensor.hpp>
 #include <MNN/MNNDefine.h>
+#include <MNN/expr/Module.hpp>
+#include <MNN/expr/Executor.hpp>
+#include <MNN/expr/ExprCreator.hpp>
 
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 #include <mutex>
@@ -730,4 +734,289 @@ MNNR_ErrorCode mnnr_run_inference_dynamic(
 void mnnr_free_output(float *output_data)
 {
     delete[] output_data;
+}
+
+// ============== Multi-Tensor Module API ==============
+
+namespace MNNExpr = MNN::Express;
+
+struct MNN_Module
+{
+    std::shared_ptr<MNNExpr::Module> module;
+    std::shared_ptr<MNNExpr::Executor::RuntimeManager> runtime;
+    std::vector<std::string> input_names;
+    std::vector<std::string> output_names;
+    std::string last_error;
+};
+
+static void write_error(char *buffer, size_t buffer_size, const std::string &message)
+{
+    if (buffer == nullptr || buffer_size == 0)
+    {
+        return;
+    }
+    size_t n = message.size() < buffer_size - 1 ? message.size() : buffer_size - 1;
+    std::memcpy(buffer, message.data(), n);
+    buffer[n] = '\0';
+}
+
+static std::vector<std::string> collect_names(const char *const *names, size_t count)
+{
+    std::vector<std::string> result;
+    for (size_t i = 0; i < count; i++)
+    {
+        if (names != nullptr && names[i] != nullptr)
+        {
+            result.emplace_back(names[i]);
+        }
+    }
+    return result;
+}
+
+MNN_Module *mnnr_module_create(
+    const void *buffer,
+    size_t size,
+    const char *const *input_names,
+    size_t num_inputs,
+    const char *const *output_names,
+    size_t num_outputs,
+    const MNNR_Config *config,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    if (buffer == nullptr || size == 0)
+    {
+        write_error(error_buffer, error_buffer_size, "Model buffer is empty");
+        return nullptr;
+    }
+
+    MNN::ScheduleConfig schedule;
+    MNN::BackendConfig backend;
+    init_schedule_config(schedule, backend, config);
+
+    std::shared_ptr<MNNExpr::Executor::RuntimeManager> runtime(
+        MNNExpr::Executor::RuntimeManager::createRuntimeManager(schedule));
+    if (!runtime)
+    {
+        write_error(error_buffer, error_buffer_size, "Failed to create runtime manager");
+        return nullptr;
+    }
+
+    MNNExpr::Module::Config module_config;
+    module_config.shapeMutable = true;
+
+    std::vector<std::string> inputs = collect_names(input_names, num_inputs);
+    std::vector<std::string> outputs = collect_names(output_names, num_outputs);
+
+    std::shared_ptr<MNNExpr::Module> module;
+    {
+        std::lock_guard<std::mutex> global_lock(g_mnn_inference_mutex);
+        module.reset(MNNExpr::Module::load(inputs, outputs, static_cast<const uint8_t *>(buffer), size,
+                                           runtime, &module_config));
+    }
+    if (!module)
+    {
+        write_error(error_buffer, error_buffer_size, "Failed to load module from buffer");
+        return nullptr;
+    }
+
+    const MNNExpr::Module::Info *info = module->getInfo();
+    auto handle = make_unique_ptr<MNN_Module>();
+    handle->module = module;
+    handle->runtime = runtime;
+    handle->input_names = (inputs.empty() && info != nullptr) ? info->inputNames : inputs;
+    handle->output_names = (outputs.empty() && info != nullptr) ? info->outputNames : outputs;
+    if (handle->input_names.empty() || handle->output_names.empty())
+    {
+        write_error(error_buffer, error_buffer_size, "Module has no inputs or outputs");
+        std::lock_guard<std::mutex> global_lock(g_mnn_inference_mutex);
+        handle->module.reset();
+        return nullptr;
+    }
+    return handle.release();
+}
+
+void mnnr_module_destroy(MNN_Module *module)
+{
+    if (module == nullptr)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> global_lock(g_mnn_inference_mutex);
+    module->module.reset();
+    module->runtime.reset();
+    delete module;
+}
+
+size_t mnnr_module_input_count(const MNN_Module *module)
+{
+    return module ? module->input_names.size() : 0;
+}
+
+size_t mnnr_module_output_count(const MNN_Module *module)
+{
+    return module ? module->output_names.size() : 0;
+}
+
+const char *mnnr_module_input_name(const MNN_Module *module, size_t index)
+{
+    if (module == nullptr || index >= module->input_names.size())
+    {
+        return nullptr;
+    }
+    return module->input_names[index].c_str();
+}
+
+const char *mnnr_module_output_name(const MNN_Module *module, size_t index)
+{
+    if (module == nullptr || index >= module->output_names.size())
+    {
+        return nullptr;
+    }
+    return module->output_names[index].c_str();
+}
+
+MNNR_ErrorCode mnnr_module_forward(
+    MNN_Module *module,
+    const MNNR_InputTensor *inputs,
+    size_t num_inputs,
+    MNNR_OutputTensor *outputs,
+    size_t num_outputs)
+{
+    if (module == nullptr || outputs == nullptr || (inputs == nullptr && num_inputs > 0))
+    {
+        return MNNR_ERROR_INVALID_PARAMETER;
+    }
+    if (num_inputs != module->input_names.size() || num_outputs < module->output_names.size())
+    {
+        module->last_error = "Input/output count mismatch";
+        return MNNR_ERROR_INVALID_PARAMETER;
+    }
+    for (size_t i = 0; i < num_outputs; i++)
+    {
+        outputs[i].data = nullptr;
+        outputs[i].element_count = 0;
+        outputs[i].ndims = 0;
+    }
+
+    std::lock_guard<std::mutex> global_lock(g_mnn_inference_mutex);
+
+    std::vector<MNNExpr::VARP> input_vars;
+    input_vars.reserve(num_inputs);
+    for (size_t i = 0; i < num_inputs; i++)
+    {
+        const MNNR_InputTensor &tensor = inputs[i];
+        if (tensor.data == nullptr || tensor.dims == nullptr || tensor.ndims == 0 || tensor.ndims > 8)
+        {
+            module->last_error = "Invalid input tensor " + module->input_names[i];
+            return MNNR_ERROR_INVALID_PARAMETER;
+        }
+        std::vector<int> dims(tensor.dims, tensor.dims + tensor.ndims);
+        size_t count = 1;
+        for (int d : dims)
+        {
+            if (d < 0)
+            {
+                module->last_error = "Negative dimension in input " + module->input_names[i];
+                return MNNR_ERROR_INVALID_PARAMETER;
+            }
+            count *= static_cast<size_t>(d);
+        }
+        MNNExpr::VARP var = MNNExpr::_Input(dims, MNNExpr::NCHW, halide_type_of<float>());
+        float *dst = var->writeMap<float>();
+        if (dst == nullptr && count > 0)
+        {
+            module->last_error = "Failed to map input " + module->input_names[i];
+            return MNNR_ERROR_RUNTIME_ERROR;
+        }
+        if (count > 0)
+        {
+            std::memcpy(dst, tensor.data, count * sizeof(float));
+        }
+        input_vars.push_back(var);
+    }
+
+    std::vector<MNNExpr::VARP> results = module->module->onForward(input_vars);
+    if (results.size() < module->output_names.size())
+    {
+        module->last_error = "Module forward failed";
+        return MNNR_ERROR_RUNTIME_ERROR;
+    }
+
+    for (size_t i = 0; i < module->output_names.size(); i++)
+    {
+        MNNExpr::VARP var = results[i];
+        const MNNExpr::Variable::Info *info = var.get() ? var->getInfo() : nullptr;
+        if (info == nullptr)
+        {
+            mnnr_module_free_outputs(outputs, num_outputs);
+            module->last_error = "Failed to compute output " + module->output_names[i];
+            return MNNR_ERROR_RUNTIME_ERROR;
+        }
+        if (info->order == MNNExpr::NC4HW4)
+        {
+            var = MNNExpr::_Convert(var, MNNExpr::NCHW);
+            info = var->getInfo();
+        }
+        bool is_float = info != nullptr && info->type.code == halide_type_float && info->type.bits == 32;
+        if (info != nullptr && !is_float && !(info->type.code == halide_type_int && info->type.bits == 32))
+        {
+            var = MNNExpr::_Cast(var, halide_type_of<int32_t>());
+            info = var->getInfo();
+        }
+        if (info == nullptr || info->dim.size() > 8)
+        {
+            mnnr_module_free_outputs(outputs, num_outputs);
+            module->last_error = "Unsupported output " + module->output_names[i];
+            return MNNR_ERROR_UNSUPPORTED;
+        }
+
+        MNNR_OutputTensor &out = outputs[i];
+        out.dtype = is_float ? MNNR_DTYPE_FLOAT32 : MNNR_DTYPE_INT32;
+        out.ndims = info->dim.size();
+        for (size_t d = 0; d < out.ndims; d++)
+        {
+            out.dims[d] = info->dim[d];
+        }
+        out.element_count = static_cast<size_t>(info->size);
+        size_t bytes = out.element_count * 4;
+        out.data = std::malloc(bytes > 0 ? bytes : 4);
+        if (out.data == nullptr)
+        {
+            mnnr_module_free_outputs(outputs, num_outputs);
+            return MNNR_ERROR_OUT_OF_MEMORY;
+        }
+        const void *src = is_float ? static_cast<const void *>(var->readMap<float>())
+                                   : static_cast<const void *>(var->readMap<int32_t>());
+        if (src == nullptr && out.element_count > 0)
+        {
+            mnnr_module_free_outputs(outputs, num_outputs);
+            module->last_error = "Failed to read output " + module->output_names[i];
+            return MNNR_ERROR_RUNTIME_ERROR;
+        }
+        if (out.element_count > 0)
+        {
+            std::memcpy(out.data, src, bytes);
+        }
+    }
+    return MNNR_SUCCESS;
+}
+
+void mnnr_module_free_outputs(MNNR_OutputTensor *outputs, size_t num_outputs)
+{
+    if (outputs == nullptr)
+    {
+        return;
+    }
+    for (size_t i = 0; i < num_outputs; i++)
+    {
+        std::free(outputs[i].data);
+        outputs[i].data = nullptr;
+        outputs[i].element_count = 0;
+    }
+}
+
+const char *mnnr_module_get_last_error(const MNN_Module *module)
+{
+    return module ? module->last_error.c_str() : "Invalid module";
 }

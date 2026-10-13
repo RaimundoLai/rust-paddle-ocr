@@ -653,7 +653,7 @@ pub fn ocr_file_with_ori(
     engine.recognize(&image)
 }
 
-fn rotate_by_angle(image: &DynamicImage, angle: i32) -> DynamicImage {
+pub(crate) fn rotate_by_angle(image: &DynamicImage, angle: i32) -> DynamicImage {
     // The model reports rotation from horizontal; rotate back to correct.
     match angle.rem_euclid(360) {
         90 => DynamicImage::ImageRgb8(image::imageops::rotate270(&image.to_rgb8())),
